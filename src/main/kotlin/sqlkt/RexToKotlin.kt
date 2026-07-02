@@ -129,6 +129,13 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             SqlKind.MINUS_PREFIX -> narrowNumeric(call, CodeBlock.of("numNeg(%L)", arg(0)))
             SqlKind.PLUS_PREFIX -> arg(0)
 
+            SqlKind.FLOOR, SqlKind.CEIL -> {
+                // Two-operand form is FLOOR(datetime TO unit) — not supported.
+                require(call.operands.size == 1) { "FLOOR/CEIL with a time unit is not supported" }
+                val fn = if (call.kind == SqlKind.FLOOR) "numFloor" else "numCeil"
+                narrowNumeric(call, CodeBlock.of("$fn(%L)", arg(0)))
+            }
+
             SqlKind.CASE -> caseWhen(call, rowVar)
             SqlKind.CAST -> cast(call.type.sqlTypeName, arg(0))
 
@@ -154,6 +161,25 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             "SUBSTRING" -> helper("substr")
             "ABS" -> narrowNumeric(call, helper("sqlAbs"))
             "MOD" -> narrowNumeric(call, helper("numMod"))
+            "POWER" -> narrowNumeric(call, helper("numPower"))
+            "SQRT" -> narrowNumeric(call, helper("numSqrt"))
+            "EXP" -> narrowNumeric(call, helper("numExp"))
+            "LN" -> narrowNumeric(call, helper("numLn"))
+            "LOG10" -> narrowNumeric(call, helper("numLog10"))
+            "SIN" -> narrowNumeric(call, helper("numSin"))
+            "COS" -> narrowNumeric(call, helper("numCos"))
+            "TAN" -> narrowNumeric(call, helper("numTan"))
+            "COT" -> narrowNumeric(call, helper("numCot"))
+            "ASIN" -> narrowNumeric(call, helper("numAsin"))
+            "ACOS" -> narrowNumeric(call, helper("numAcos"))
+            "ATAN" -> narrowNumeric(call, helper("numAtan"))
+            "ATAN2" -> narrowNumeric(call, helper("numAtan2"))
+            "DEGREES" -> narrowNumeric(call, helper("numDegrees"))
+            "RADIANS" -> narrowNumeric(call, helper("numRadians"))
+            "SIGN" -> narrowNumeric(call, helper("numSign"))
+            "ROUND" -> narrowNumeric(call, helper("numRound"))
+            "TRUNCATE" -> narrowNumeric(call, helper("numTruncate"))
+            "PI" -> CodeBlock.of("kotlin.math.PI")
             "COALESCE" -> helper("coalesce") // normally rewritten to CASE by Calcite
             "CURRENT_DATE" -> CodeBlock.of("java.time.LocalDate.now()")
             "CURRENT_TIMESTAMP", "LOCALTIMESTAMP" -> CodeBlock.of("java.time.LocalDateTime.now()")

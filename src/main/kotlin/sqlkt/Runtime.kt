@@ -123,6 +123,74 @@ private fun sqlAbs(a: Any?): Number? {
 
 private fun coalesce(vararg values: Any?): Any? = values.firstOrNull { it != null }
 
+// Math functions. Transcendentals compute in Double; the generated code narrows
+// results back to the SQL-derived type via asInt/asLong/asDouble.
+private fun math1(x: Any?, f: (Double) -> Double): Double? = (x as Number?)?.let { f(it.toDouble()) }
+
+private fun numPower(a: Any?, b: Any?): Double? =
+    if (a == null || b == null) null else Math.pow((a as Number).toDouble(), (b as Number).toDouble())
+
+private fun numSqrt(x: Any?): Double? = math1(x) { kotlin.math.sqrt(it) }
+private fun numExp(x: Any?): Double? = math1(x) { kotlin.math.exp(it) }
+private fun numLn(x: Any?): Double? = math1(x) { kotlin.math.ln(it) }
+private fun numLog10(x: Any?): Double? = math1(x) { kotlin.math.log10(it) }
+private fun numSin(x: Any?): Double? = math1(x) { kotlin.math.sin(it) }
+private fun numCos(x: Any?): Double? = math1(x) { kotlin.math.cos(it) }
+private fun numTan(x: Any?): Double? = math1(x) { kotlin.math.tan(it) }
+private fun numCot(x: Any?): Double? = math1(x) { 1.0 / kotlin.math.tan(it) }
+private fun numAsin(x: Any?): Double? = math1(x) { kotlin.math.asin(it) }
+private fun numAcos(x: Any?): Double? = math1(x) { kotlin.math.acos(it) }
+private fun numAtan(x: Any?): Double? = math1(x) { kotlin.math.atan(it) }
+private fun numDegrees(x: Any?): Double? = math1(x) { Math.toDegrees(it) }
+private fun numRadians(x: Any?): Double? = math1(x) { Math.toRadians(it) }
+
+private fun numAtan2(a: Any?, b: Any?): Double? =
+    if (a == null || b == null) null
+    else kotlin.math.atan2((a as Number).toDouble(), (b as Number).toDouble())
+
+private fun numSign(x: Any?): Int? = (x as Number?)?.toDouble()?.let { kotlin.math.sign(it).toInt() }
+
+/** FLOOR/CEIL preserve integral values; floating point is floored/ceiled. */
+private fun numFloor(x: Any?): Number? = when (x) {
+    null -> null
+    is Double -> kotlin.math.floor(x)
+    is Float -> kotlin.math.floor(x.toDouble())
+    else -> x as Number
+}
+
+private fun numCeil(x: Any?): Number? = when (x) {
+    null -> null
+    is Double -> kotlin.math.ceil(x)
+    is Float -> kotlin.math.ceil(x.toDouble())
+    else -> x as Number
+}
+
+/** SQL ROUND(x [, n]): half-up rounding to n decimal places (n may be negative). */
+private fun numRound(x: Any?, n: Any? = null): Number? {
+    if (x == null || (n == null && x !is Double && x !is Float)) return x as Number?
+    val scale = (n as Number?)?.toInt() ?: 0
+    return if (x is Double || x is Float) {
+        java.math.BigDecimal.valueOf((x as Number).toDouble())
+            .setScale(scale, java.math.RoundingMode.HALF_UP).toDouble()
+    } else {
+        java.math.BigDecimal.valueOf((x as Number).toLong())
+            .setScale(scale, java.math.RoundingMode.HALF_UP).toLong()
+    }
+}
+
+/** SQL TRUNCATE(x [, n]): rounding toward zero to n decimal places. */
+private fun numTruncate(x: Any?, n: Any? = null): Number? {
+    if (x == null || (n == null && x !is Double && x !is Float)) return x as Number?
+    val scale = (n as Number?)?.toInt() ?: 0
+    return if (x is Double || x is Float) {
+        java.math.BigDecimal.valueOf((x as Number).toDouble())
+            .setScale(scale, java.math.RoundingMode.DOWN).toDouble()
+    } else {
+        java.math.BigDecimal.valueOf((x as Number).toLong())
+            .setScale(scale, java.math.RoundingMode.DOWN).toLong()
+    }
+}
+
 /** SQL LIKE with % and _ wildcards. */
 private fun like(s: Any?, pattern: Any?): Boolean? {
     if (s == null || pattern == null) return null
