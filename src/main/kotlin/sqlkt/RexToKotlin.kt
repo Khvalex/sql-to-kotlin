@@ -1,6 +1,7 @@
 package sqlkt
 
 import com.squareup.kotlinpoet.CodeBlock
+import org.apache.calcite.avatica.util.TimeUnitRange
 import org.apache.calcite.rex.RexBuilder
 import org.apache.calcite.rex.RexCall
 import org.apache.calcite.rex.RexInputRef
@@ -9,6 +10,9 @@ import org.apache.calcite.rex.RexNode
 import org.apache.calcite.rex.RexUtil
 import org.apache.calcite.sql.SqlKind
 import org.apache.calcite.sql.type.SqlTypeName
+import org.apache.calcite.util.DateString
+import org.apache.calcite.util.TimeString
+import org.apache.calcite.util.TimestampString
 import java.math.BigDecimal
 
 /**
@@ -52,9 +56,28 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
                 CodeBlock.of("%L", lit.getValueAs(Double::class.javaObjectType))
             SqlTypeName.CHAR, SqlTypeName.VARCHAR ->
                 CodeBlock.of("%S", lit.getValueAs(String::class.java))
+            SqlTypeName.DATE ->
+                CodeBlock.of("java.time.LocalDate.parse(%S)", lit.getValueAs(DateString::class.java).toString())
+            SqlTypeName.TIME ->
+                CodeBlock.of("java.time.LocalTime.parse(%S)", lit.getValueAs(TimeString::class.java).toString())
+            SqlTypeName.TIMESTAMP ->
+                CodeBlock.of(
+                    "java.time.LocalDateTime.parse(%S)",
+                    lit.getValueAs(TimestampString::class.java).toString().replace(' ', 'T'),
+                )
+            in SqlTypeName.YEAR_INTERVAL_TYPES ->
+                // Year-month intervals are stored as a number of months.
+                CodeBlock.of("java.time.Period.ofMonths(%L)", lit.getValueAs(BigDecimal::class.java)!!.intValueExact())
+            in SqlTypeName.DAY_INTERVAL_TYPES ->
+                // Day-time intervals are stored as a number of milliseconds.
+                CodeBlock.of("java.time.Duration.ofMillis(%LL)", lit.getValueAs(BigDecimal::class.java)!!.longValueExact())
             else -> throw UnsupportedOperationException("Unsupported literal type: ${lit.type.sqlTypeName}")
         }
     }
+
+    private fun isDatetime(type: SqlTypeName): Boolean =
+        type == SqlTypeName.DATE || type == SqlTypeName.TIME ||
+            type == SqlTypeName.TIMESTAMP || type == SqlTypeName.TIMESTAMP_WITH_LOCAL_TIME_ZONE
 
     private fun call(call: RexCall, rowVar: String): CodeBlock {
         fun arg(i: Int) = translate(call.operands[i], rowVar)
@@ -84,8 +107,22 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             SqlKind.IS_FALSE -> CodeBlock.of("(%L == false)", arg(0))
             SqlKind.IS_NOT_FALSE -> CodeBlock.of("(%L != false)", arg(0))
 
-            SqlKind.PLUS -> narrowNumeric(call, helper("numAdd"))
-            SqlKind.MINUS -> narrowNumeric(call, helper("numSub"))
+            // `datetime + interval` keeps the PLUS/MINUS kind but a datetime type.
+            SqlKind.PLUS ->
+                if (isDatetime(call.type.sqlTypeName)) helper("dtPlus") else narrowNumeric(call, helper("numAdd"))
+            SqlKind.MINUS -> when {
+                isDatetime(call.type.sqlTypeName) -> helper("dtMinus")
+                // `datetime - datetime` (MINUS_DATE operator, kind MINUS) yields an interval.
+                call.type.sqlTypeName in SqlTypeName.YEAR_INTERVAL_TYPES ->
+                    CodeBlock.of("dtDiffMonths(%L, %L)", arg(0), arg(1))
+                call.type.sqlTypeName in SqlTypeName.DAY_INTERVAL_TYPES ->
+                    CodeBlock.of("dtDiffDuration(%L, %L)", arg(0), arg(1))
+                else -> narrowNumeric(call, helper("numSub"))
+            }
+            SqlKind.EXTRACT -> {
+                val unit = (call.operands[0] as RexLiteral).getValueAs(TimeUnitRange::class.java)!!.name
+                CodeBlock.of("extractField(%S, %L)", unit, arg(1))
+            }
             SqlKind.TIMES -> narrowNumeric(call, helper("numMul"))
             SqlKind.DIVIDE -> narrowNumeric(call, helper("numDiv"))
             SqlKind.MOD -> narrowNumeric(call, helper("numMod"))
@@ -118,6 +155,9 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             "ABS" -> narrowNumeric(call, helper("sqlAbs"))
             "MOD" -> narrowNumeric(call, helper("numMod"))
             "COALESCE" -> helper("coalesce") // normally rewritten to CASE by Calcite
+            "CURRENT_DATE" -> CodeBlock.of("java.time.LocalDate.now()")
+            "CURRENT_TIMESTAMP", "LOCALTIMESTAMP" -> CodeBlock.of("java.time.LocalDateTime.now()")
+            "CURRENT_TIME", "LOCALTIME" -> CodeBlock.of("java.time.LocalTime.now()")
             else -> throw UnsupportedOperationException("Unsupported SQL function/operator: ${call.operator.name}")
         }
     }
@@ -145,6 +185,9 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
         SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE, SqlTypeName.DECIMAL -> CodeBlock.of("asDouble(%L)", value)
         SqlTypeName.CHAR, SqlTypeName.VARCHAR -> CodeBlock.of("asString(%L)", value)
         SqlTypeName.BOOLEAN -> CodeBlock.of("asBoolean(%L)", value)
+        SqlTypeName.DATE -> CodeBlock.of("asDate(%L)", value)
+        SqlTypeName.TIME -> CodeBlock.of("asTime(%L)", value)
+        SqlTypeName.TIMESTAMP -> CodeBlock.of("asTimestamp(%L)", value)
         else -> throw UnsupportedOperationException("Unsupported CAST target type: $target")
     }
 

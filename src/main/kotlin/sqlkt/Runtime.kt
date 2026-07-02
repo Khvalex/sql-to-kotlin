@@ -137,6 +137,104 @@ private fun like(s: Any?, pattern: Any?): Boolean? {
     return Regex(regex.toString(), RegexOption.DOT_MATCHES_ALL).matches(s as String)
 }
 
+// Date/time. SQL DATE -> LocalDate, TIME -> LocalTime, TIMESTAMP -> LocalDateTime;
+// intervals: day-time -> Duration, year-month -> Period.
+private fun asDate(x: Any?): java.time.LocalDate? = when (x) {
+    null -> null
+    is java.time.LocalDate -> x
+    is java.time.LocalDateTime -> x.toLocalDate()
+    is String -> java.time.LocalDate.parse(x.trim())
+    else -> throw IllegalArgumentException("Cannot cast value to DATE: " + x)
+}
+
+private fun asTime(x: Any?): java.time.LocalTime? = when (x) {
+    null -> null
+    is java.time.LocalTime -> x
+    is java.time.LocalDateTime -> x.toLocalTime()
+    is String -> java.time.LocalTime.parse(x.trim())
+    else -> throw IllegalArgumentException("Cannot cast value to TIME: " + x)
+}
+
+private fun asTimestamp(x: Any?): java.time.LocalDateTime? = when (x) {
+    null -> null
+    is java.time.LocalDateTime -> x
+    is java.time.LocalDate -> x.atStartOfDay()
+    is String -> java.time.LocalDateTime.parse(x.trim().replace(' ', 'T'))
+    else -> throw IllegalArgumentException("Cannot cast value to TIMESTAMP: " + x)
+}
+
+/** `datetime + interval` (either operand order). */
+private fun dtPlus(a: Any?, b: Any?): Any? {
+    if (a == null || b == null) return null
+    val (dt, iv) = if (a is java.time.temporal.Temporal) a to b else b to a
+    return when (dt) {
+        is java.time.LocalDate -> when (iv) {
+            is java.time.Duration -> dt.plusDays(iv.toDays())
+            is java.time.Period -> dt.plus(iv)
+            else -> throw IllegalArgumentException("Cannot add to DATE: " + iv)
+        }
+        is java.time.LocalDateTime -> when (iv) {
+            is java.time.Duration -> dt.plus(iv)
+            is java.time.Period -> dt.plus(iv)
+            else -> throw IllegalArgumentException("Cannot add to TIMESTAMP: " + iv)
+        }
+        is java.time.LocalTime -> when (iv) {
+            is java.time.Duration -> dt.plus(iv)
+            else -> throw IllegalArgumentException("Cannot add to TIME: " + iv)
+        }
+        else -> throw IllegalArgumentException("Cannot add interval to: " + dt)
+    }
+}
+
+private fun dtMinus(a: Any?, b: Any?): Any? = when (b) {
+    null -> null
+    is java.time.Duration -> dtPlus(a, b.negated())
+    is java.time.Period -> dtPlus(a, b.negated())
+    else -> throw IllegalArgumentException("Cannot subtract from a datetime: " + b)
+}
+
+private fun toDateTime(x: Any?): java.time.LocalDateTime = when (x) {
+    is java.time.LocalDateTime -> x
+    is java.time.LocalDate -> x.atStartOfDay()
+    else -> throw IllegalArgumentException("Not a datetime value: " + x)
+}
+
+/** `datetime - datetime` with a day-time interval result. */
+private fun dtDiffDuration(a: Any?, b: Any?): java.time.Duration? =
+    if (a == null || b == null) null else java.time.Duration.between(toDateTime(b), toDateTime(a))
+
+/** `datetime - datetime` with a year-month interval result. */
+private fun dtDiffMonths(a: Any?, b: Any?): java.time.Period =
+    java.time.Period.ofMonths(java.time.temporal.ChronoUnit.MONTHS.between(toDateTime(b), toDateTime(a)).toInt())
+
+/** EXTRACT(unit FROM datetime); returns BIGINT (Long) per Calcite's typing. */
+private fun extractField(unit: String, x: Any?): Long? {
+    if (x == null) return null
+    val date = when (x) {
+        is java.time.LocalDate -> x
+        is java.time.LocalDateTime -> x.toLocalDate()
+        else -> null
+    }
+    val time = when (x) {
+        is java.time.LocalTime -> x
+        is java.time.LocalDateTime -> x.toLocalTime()
+        else -> null
+    }
+    return when (unit) {
+        "YEAR" -> date?.year?.toLong()
+        "QUARTER" -> date?.let { ((it.monthValue - 1) / 3 + 1).toLong() }
+        "MONTH" -> date?.monthValue?.toLong()
+        "DAY" -> date?.dayOfMonth?.toLong()
+        "DOY" -> date?.dayOfYear?.toLong()
+        "DOW" -> date?.dayOfWeek?.value?.let { (it % 7 + 1).toLong() } // SQL: Sunday = 1
+        "WEEK" -> date?.get(java.time.temporal.WeekFields.ISO.weekOfWeekBasedYear())?.toLong()
+        "HOUR" -> time?.hour?.toLong()
+        "MINUTE" -> time?.minute?.toLong()
+        "SECOND" -> time?.second?.toLong()
+        else -> throw UnsupportedOperationException("EXTRACT unit not supported: " + unit)
+    }
+}
+
 // Joins. A row of the joined relation is the concatenation of a left row and a
 // right row; the condition sees that concatenated row (matching Calcite's
 // convention for join conditions).

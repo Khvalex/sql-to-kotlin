@@ -1,6 +1,8 @@
 package sqlkt
 
 import org.apache.calcite.sql.type.SqlTypeName
+import java.time.LocalDate
+import java.time.LocalDateTime
 
 /** Synthetic test schema: three tables with a mix of types and nullable columns. */
 val TEST_SCHEMA = SqlSchema(
@@ -31,6 +33,8 @@ val TEST_SCHEMA = SqlSchema(
                 Column("EMP_ID", SqlTypeName.INTEGER),
                 Column("AMOUNT", SqlTypeName.DOUBLE),
                 Column("STATUS", SqlTypeName.VARCHAR),
+                Column("ORDER_DATE", SqlTypeName.DATE),
+                Column("SHIPPED_AT", SqlTypeName.TIMESTAMP),
             ),
         ),
     ),
@@ -42,8 +46,17 @@ fun emp(id: Int, name: String?, deptno: Int?, salary: Double?, age: Int?, active
 fun dept(deptno: Int, dname: String?, budget: Double?): Map<String, Any?> =
     mapOf("DEPTNO" to deptno, "DNAME" to dname, "BUDGET" to budget)
 
-fun order(orderId: Int, empId: Int?, amount: Double?, status: String?): Map<String, Any?> =
-    mapOf("ORDER_ID" to orderId, "EMP_ID" to empId, "AMOUNT" to amount, "STATUS" to status)
+fun order(
+    orderId: Int,
+    empId: Int?,
+    amount: Double?,
+    status: String?,
+    orderDate: LocalDate? = null,
+    shippedAt: LocalDateTime? = null,
+): Map<String, Any?> = mapOf(
+    "ORDER_ID" to orderId, "EMP_ID" to empId, "AMOUNT" to amount, "STATUS" to status,
+    "ORDER_DATE" to orderDate, "SHIPPED_AT" to shippedAt,
+)
 
 /** Shared test data. Includes nulls to exercise SQL null semantics. */
 val TEST_TABLES: Map<String, List<Map<String, Any?>>> = mapOf(
@@ -62,11 +75,11 @@ val TEST_TABLES: Map<String, List<Map<String, Any?>>> = mapOf(
         dept(40, "Empty", 1000.0),
     ),
     "ORDERS" to listOf(
-        order(100, 1, 250.0, "SHIPPED"),
-        order(101, 1, 100.0, "PENDING"),
-        order(102, 2, 75.0, "SHIPPED"),
-        order(103, 3, 300.0, "CANCELLED"),
+        order(100, 1, 250.0, "SHIPPED", LocalDate.parse("2024-01-10"), LocalDateTime.parse("2024-01-11T10:30:00")),
+        order(101, 1, 100.0, "PENDING", LocalDate.parse("2024-02-05")),
+        order(102, 2, 75.0, "SHIPPED", LocalDate.parse("2024-02-20"), LocalDateTime.parse("2024-02-21T08:00:00")),
+        order(103, 3, 300.0, "CANCELLED", LocalDate.parse("2024-03-01")),
         order(104, null, 50.0, "PENDING"),
-        order(105, 2, null, "SHIPPED"),
+        order(105, 2, null, "SHIPPED", LocalDate.parse("2024-03-15"), LocalDateTime.parse("2024-03-15T23:45:00")),
     ),
 )
