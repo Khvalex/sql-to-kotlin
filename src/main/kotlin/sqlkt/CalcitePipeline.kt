@@ -9,7 +9,7 @@ import org.apache.calcite.prepare.CalciteCatalogReader
 import org.apache.calcite.rel.RelNode
 import org.apache.calcite.rel.type.RelDataType
 import org.apache.calcite.rel.type.RelDataTypeFactory
-import org.apache.calcite.rel.type.RelDataTypeSystem
+import org.apache.calcite.rel.type.RelDataTypeSystemImpl
 import org.apache.calcite.rex.RexBuilder
 import org.apache.calcite.schema.impl.AbstractTable
 import org.apache.calcite.sql.`fun`.SqlStdOperatorTable
@@ -29,7 +29,13 @@ import java.util.Properties
  */
 class CalcitePipeline(schema: SqlSchema) {
 
-    val typeFactory: RelDataTypeFactory = SqlTypeFactoryImpl(RelDataTypeSystem.DEFAULT)
+    private val typeSystem = object : RelDataTypeSystemImpl() {
+        // CASE/UNION branches with CHAR literals of different lengths become
+        // VARCHAR instead of space-padded CHAR ('high' rather than 'high   ').
+        override fun shouldConvertRaggedUnionTypesToVarying(): Boolean = true
+    }
+
+    val typeFactory: RelDataTypeFactory = SqlTypeFactoryImpl(typeSystem)
     val rexBuilder = RexBuilder(typeFactory)
 
     private val catalogReader: CalciteCatalogReader
