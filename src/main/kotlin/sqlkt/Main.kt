@@ -27,7 +27,8 @@ fun main(args: Array<String>) {
             ),
         ),
     )
-    val sql = args.firstOrNull() ?: """
+    // `@path` reads the SQL from a file (gradle --args mangles quotes/newlines).
+    val sql = args.firstOrNull()?.let { if (it.startsWith("@")) java.io.File(it.drop(1)).readText() else it } ?: """
         SELECT d.dname, count(*) AS cnt, avg(e.salary) AS avg_sal
         FROM emp e
         JOIN dept d ON e.deptno = d.deptno
