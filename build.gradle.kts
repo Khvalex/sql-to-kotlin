@@ -13,7 +13,6 @@ repositories {
 
 dependencies {
     implementation("org.apache.calcite:calcite-core:1.38.0")
-    implementation("com.squareup:kotlinpoet:1.18.1")
 
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")

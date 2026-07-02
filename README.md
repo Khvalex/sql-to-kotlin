@@ -3,7 +3,7 @@
 Конвертер SQL-запросов в исполняемый Kotlin-код поверх стандартного collections API.
 
 Текст SQL → Apache Calcite (parser → validator → `SqlToRelConverter`) → обход
-`RelNode`-дерева → KotlinPoet → самодостаточный `.kt`-файл с функцией
+`RelNode`-дерева → кодогенератор → самодостаточный `.kt`-файл с функцией
 
 ```kotlin
 fun query(tables: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>>
@@ -34,18 +34,52 @@ LIMIT 10
 Выход (тело `query`, плюс приватная рантайм-прелюдия в том же файле):
 
 ```kotlin
-val v0: List<List<Any?>> = tables.getValue("EMP").map { r -> listOf(r["ID"], r["NAME"], r["DEPTNO"], r["SALARY"]) }
-val v1: List<List<Any?>> = tables.getValue("DEPT").map { r -> listOf(r["DEPTNO"], r["DNAME"]) }
-val v2 = joinRows(v0, v1, 4, 2, JoinType.INNER) { row -> truth(eq(row[2], row[4])) }
-val v3 = v2.filter { row -> truth(gt(row[3], asDouble(500))) }
-val v4 = v3.map { row -> listOf<Any?>(row[5], row[3]) }
-val v5 = v4.groupBy { row -> listOf(row[0]) }.map { (key, group) -> key +
-    listOf<Any?>(asLong(group.size.toLong()), asDouble(aggAvg(group.map { it[1] }))) }
-val v6 = v5.filter { row -> truth(gte(row[1], 1)) }
-val v7 = v6.sortedWith(rowComparator(listOf(SortKey(2, false, true))))
-val v8 = v7.take(10)
-return v8.map { row -> mapOf("DNAME" to row[0], "CNT" to row[1], "AVG_SAL" to row[2]) }
+fun query(tables: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>> {
+    val emp = tables.getValue("EMP")
+        .map { r -> listOf<Any?>(r["ID"], r["NAME"], r["DEPTNO"], r["SALARY"]) }
+    val dept = tables.getValue("DEPT")
+        .map { r -> listOf<Any?>(r["DEPTNO"], r["DNAME"]) }
+    val joined = joinRows(emp, dept, leftArity = 4, rightArity = 2, JoinType.INNER) { row ->
+        val deptno = row[2]
+        val deptno2 = row[4]
+        truth(eq(deptno, deptno2))
+    }
+    return joined
+        .filter { row ->
+            val salary = row[3]
+            truth(gt(salary, 500.0))
+        }
+        .map { row ->
+            val salary = row[3]
+            val dname = row[5]
+            listOf<Any?>(
+                dname,
+                salary,
+            )
+        }
+        .groupBy { row -> listOf(row[0]) } // GROUP BY DNAME
+        .map { (key, group) ->
+            key + listOf<Any?>(
+                group.size.toLong(), // COUNT(*)
+                aggAvg(group.map { it[1] }), // AVG(SALARY)
+            )
+        }
+        .filter { row ->
+            val cnt = row[1]
+            truth(gte(cnt, 1))
+        }
+        .sortedWith(rowComparator(listOf(SortKey(2, asc = false, nullsFirst = true)))) // ORDER BY AVG_SAL DESC
+        .take(10)
+        .map { row -> mapOf("DNAME" to row[0], "CNT" to row[1], "AVG_SAL" to row[2]) }
+}
 ```
+
+Генератор старается выдавать код, который можно читать глазами: колонки
+раскрываются в именованные локальные `val`, линейные цепочки операторов
+эмитятся fluent-цепочкой, повторяющиеся подвыражения выносятся в один `val`
+(алиас колонки становится его именем), таблицы, сканируемые дважды,
+материализуются один раз, `GROUP BY`/`ORDER BY`/агрегаты аннотируются
+комментариями.
 
 ## Архитектура
 
@@ -60,7 +94,10 @@ return v8.map { row -> mapOf("DNAME" to row[0], "CNT" to row[1], "AVG_SAL" to ro
 4. **Кодогенерация** — обход дерева снизу вверх, один Kotlin-стейтмент на
    оператор (`RelToKotlin`); выражения `RexNode` транслируются в выражения
    Kotlin (`RexToKotlin`, `Sarg`/`SEARCH` раскрывается через
-   `RexUtil.expandSearch`). Файл собирается KotlinPoet.
+   `RexUtil.expandSearch`). Текст файла собирается собственным эмиттером:
+   изначально использовался KotlinPoet, но его автоперенос строк ломал
+   выражения посередине вызова и не поддавался настройке, поэтому ради
+   читаемости вывода от него отказались.
 
 Строки внутри конвейера позиционные (`List<Any?>`) — `RexInputRef(i)` дословно
 превращается в `row[i]`, разрешение имён не нужно. SQL-семантика (трёхзначная
