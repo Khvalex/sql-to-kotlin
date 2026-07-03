@@ -7,9 +7,9 @@ abstract class ConverterTestBase {
     private val converter = SqlToKotlinConverter(TEST_SCHEMA)
 
     /** SQL -> generated .kt -> compile -> run against [TEST_TABLES]. */
-    protected fun run(sql: String): List<Map<String, Any?>> {
+    protected fun run(sql: String, params: List<Any?> = emptyList()): List<Map<String, Any?>> {
         val source = converter.convert(sql)
-        return GeneratedCodeRunner.compileAndRun(source, TEST_TABLES)
+        return GeneratedCodeRunner.compileAndRun(source, TEST_TABLES, params)
     }
 
     /** For queries with ORDER BY: row order matters. */

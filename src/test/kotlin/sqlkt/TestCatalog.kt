@@ -10,7 +10,7 @@ val TEST_SCHEMA = SqlSchema(
         TableDef(
             "EMP",
             listOf(
-                Column("ID", SqlTypeName.INTEGER, nullable = false),
+                Column("ID", SqlTypeName.INTEGER, nullable = false, unique = true),
                 Column("NAME", SqlTypeName.VARCHAR),
                 Column("DEPTNO", SqlTypeName.INTEGER),
                 Column("SALARY", SqlTypeName.DOUBLE),
@@ -21,7 +21,7 @@ val TEST_SCHEMA = SqlSchema(
         TableDef(
             "DEPT",
             listOf(
-                Column("DEPTNO", SqlTypeName.INTEGER, nullable = false),
+                Column("DEPTNO", SqlTypeName.INTEGER, nullable = false, unique = true),
                 Column("DNAME", SqlTypeName.VARCHAR),
                 Column("BUDGET", SqlTypeName.DOUBLE),
             ),
@@ -29,7 +29,7 @@ val TEST_SCHEMA = SqlSchema(
         TableDef(
             "ORDERS",
             listOf(
-                Column("ORDER_ID", SqlTypeName.INTEGER, nullable = false),
+                Column("ORDER_ID", SqlTypeName.INTEGER, nullable = false, unique = true),
                 Column("EMP_ID", SqlTypeName.INTEGER),
                 Column("AMOUNT", SqlTypeName.DOUBLE),
                 Column("STATUS", SqlTypeName.VARCHAR),

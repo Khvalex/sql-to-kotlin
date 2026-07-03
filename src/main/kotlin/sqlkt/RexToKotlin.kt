@@ -1,8 +1,10 @@
 package sqlkt
 
 import org.apache.calcite.avatica.util.TimeUnitRange
+import org.apache.calcite.rel.type.RelDataType
 import org.apache.calcite.rex.RexBuilder
 import org.apache.calcite.rex.RexCall
+import org.apache.calcite.rex.RexDynamicParam
 import org.apache.calcite.rex.RexInputRef
 import org.apache.calcite.rex.RexLiteral
 import org.apache.calcite.rex.RexNode
@@ -10,15 +12,12 @@ import org.apache.calcite.rex.RexUtil
 import org.apache.calcite.rex.RexVisitorImpl
 import org.apache.calcite.sql.SqlKind
 import org.apache.calcite.sql.type.SqlTypeName
-import org.apache.calcite.util.DateString
-import org.apache.calcite.util.TimeString
-import org.apache.calcite.util.TimestampString
 import java.math.BigDecimal
 
 /**
  * Translation context for one generated lambda.
  *
- * @param bindings input ref index -> local variable name (`val salary = row[3]`)
+ * @param bindings input ref index -> accessor (`row.salary`, `l.deptno`)
  * @param shared   rex digest -> local variable holding a common subexpression
  * @param indent   absolute indentation of the expression, for multi-line `when`
  */
@@ -31,10 +30,12 @@ data class RexContext(
 /**
  * Translates a scalar [RexNode] expression tree into Kotlin source text.
  *
- * Expressions evaluate to `Any?` against a positional row `List<Any?>`;
- * input refs resolve through [RexContext.bindings] so the generated code reads
- * `salary > 900.0` instead of `row[3] > ...`. SQL null semantics live in the
- * runtime prelude helpers, which all accept `Any?`.
+ * Invariant: the static Kotlin type of the emitted expression matches
+ * [kotlinType] of the node's Calcite-derived type, nullability included.
+ * Non-null operands therefore get native Kotlin operators (`a > b`, `a + b`,
+ * `s.uppercase()`); nullable ones go through the SQL-semantics helpers from
+ * the runtime prelude (`gt`, `addD`, ...), and the rare spots where a helper
+ * is statically nullable but Calcite derives NOT NULL are coerced with `!!`.
  */
 class RexToKotlin(private val rexBuilder: RexBuilder) {
 
@@ -80,8 +81,6 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
         val kept = mutableListOf<Info>()
         val keptDigests = mutableSetOf<String>()
 
-        // Occurrences of [digest] in [root], treating selected subtrees as opaque
-        // locals. [countRoot] is false when [root] is a selected subtree's own body.
         fun occurrences(root: RexNode, digest: String, countRoot: Boolean): Int {
             var n = 0
             fun visit(node: RexNode, isRoot: Boolean) {
@@ -111,12 +110,18 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
         return kept.sortedBy { it.size }.map { it.node }
     }
 
-    /** Kotlin expression (type `Any?`) for an already [expand]ed node. */
+    // ------------------------------------------------------------ emission
+
+    private fun nn(node: RexNode): Boolean = !node.type.isNullable
+
+    /** Kotlin expression for an already [expand]ed node; see the class invariant. */
     fun expr(node: RexNode, ctx: RexContext): String {
         ctx.shared[node.toString()]?.let { return it }
         return when (node) {
             is RexInputRef -> ctx.bindings[node.index] ?: "row[${node.index}]"
             is RexLiteral -> literal(node)
+            // JDBC-style `?` placeholders: bound at runtime from the params list.
+            is RexDynamicParam -> "(params[${node.index}] as ${kotlinType(node.type)})"
             is RexCall -> call(node, ctx)
             else -> throw UnsupportedOperationException(
                 "Unsupported expression node ${node::class.simpleName}: $node " +
@@ -125,10 +130,50 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
         }
     }
 
-    /** Kotlin `Boolean` (non-null) expression, for filter/join conditions and `when` branches. */
+    /**
+     * Kotlin `Boolean` (non-null) expression, for filter/join conditions and
+     * `when` branches. In this context only TRUE passes, which lets AND/OR
+     * decompose into `&&` / `||` without losing SQL 3-valued semantics, and
+     * `a = b` become native `==` when at least one side is non-null.
+     */
     fun condition(node: RexNode, ctx: RexContext): String {
-        val e = expr(node, ctx)
-        return if (node.toString() !in ctx.shared && isNonNullBoolean(node)) stripOuterParens(e) else "truth($e)"
+        if (node.toString() in ctx.shared) {
+            val e = expr(node, ctx)
+            return if (nn(node)) e else "truth($e)"
+        }
+        return when (node.kind) {
+            SqlKind.AND -> (node as RexCall).operands.joinToString(" && ") { condition(it, ctx) }
+            SqlKind.OR -> "(" + (node as RexCall).operands.joinToString(" || ") { condition(it, ctx) } + ")"
+            SqlKind.NOT -> {
+                val op = (node as RexCall).operands[0]
+                if (nn(op)) "!${parenthesize(expr(op, ctx))}" else "${expr(op, ctx)} == false"
+            }
+            SqlKind.EQUALS -> {
+                // NULL = x is never TRUE, and Kotlin `null == x` is false when
+                // x is non-null — so one non-null side is enough for native ==.
+                val (a, b) = (node as RexCall).operands
+                if ((nn(a) || nn(b)) && sameBaseType(a.type, b.type)) {
+                    "${expr(a, ctx)} == ${expr(b, ctx)}"
+                } else {
+                    "truth(eq(${expr(a, ctx)}, ${expr(b, ctx)}))"
+                }
+            }
+            else -> {
+                val e = expr(node, ctx)
+                if (staticBoolean(node)) stripOuterParens(e) else "truth($e)"
+            }
+        }
+    }
+
+    /** True when [expr] for this node is statically a non-null Kotlin Boolean. */
+    private fun staticBoolean(node: RexNode): Boolean = when (node.kind) {
+        SqlKind.IS_NULL, SqlKind.IS_NOT_NULL,
+        SqlKind.IS_TRUE, SqlKind.IS_NOT_TRUE,
+        SqlKind.IS_FALSE, SqlKind.IS_NOT_FALSE,
+        SqlKind.IS_DISTINCT_FROM, SqlKind.IS_NOT_DISTINCT_FROM,
+        -> true
+
+        else -> nn(node) && node.type.sqlTypeName == SqlTypeName.BOOLEAN
     }
 
     /** `(salary != null)` -> `salary != null` when the parens wrap the whole expression. */
@@ -144,15 +189,13 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
         return e.substring(1, e.length - 1)
     }
 
-    private fun isNonNullBoolean(node: RexNode): Boolean = when (node.kind) {
-        SqlKind.IS_NULL, SqlKind.IS_NOT_NULL,
-        SqlKind.IS_TRUE, SqlKind.IS_NOT_TRUE,
-        SqlKind.IS_FALSE, SqlKind.IS_NOT_FALSE,
-        SqlKind.IS_DISTINCT_FROM, SqlKind.IS_NOT_DISTINCT_FROM,
-        -> true
+    /** Wraps in parens unless the expression is a simple accessor or call. */
+    private fun parenthesize(e: String): String =
+        if (e.matches(Regex("[A-Za-z_][A-Za-z0-9_.]*(\\(.*\\))?")) && !e.contains(' ')) e else "($e)"
 
-        else -> false
-    }
+    /** Coerces a statically nullable emission when Calcite derives NOT NULL. */
+    private fun nnWrap(type: RelDataType, text: String): String =
+        if (!type.isNullable) "$text!!" else text
 
     private fun literal(lit: RexLiteral): String {
         if (lit.isNull) return "null"
@@ -171,17 +214,15 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             SqlTypeName.CHAR, SqlTypeName.VARCHAR ->
                 kotlinString(lit.getValueAs(String::class.java)!!)
             SqlTypeName.DATE ->
-                "java.time.LocalDate.parse(${kotlinString(lit.getValueAs(DateString::class.java).toString())})"
+                "java.time.LocalDate.parse(${kotlinString(lit.getValueAs(DateStringClass).toString())})"
             SqlTypeName.TIME ->
-                "java.time.LocalTime.parse(${kotlinString(lit.getValueAs(TimeString::class.java).toString())})"
+                "java.time.LocalTime.parse(${kotlinString(lit.getValueAs(TimeStringClass).toString())})"
             SqlTypeName.TIMESTAMP ->
                 "java.time.LocalDateTime.parse(" +
-                    kotlinString(lit.getValueAs(TimestampString::class.java).toString().replace(' ', 'T')) + ")"
+                    kotlinString(lit.getValueAs(TimestampStringClass).toString().replace(' ', 'T')) + ")"
             in SqlTypeName.YEAR_INTERVAL_TYPES ->
-                // Year-month intervals are stored as a number of months.
                 "java.time.Period.ofMonths(${lit.getValueAs(BigDecimal::class.java)!!.intValueExact()})"
             in SqlTypeName.DAY_INTERVAL_TYPES ->
-                // Day-time intervals are stored as a number of milliseconds.
                 "java.time.Duration.ofMillis(${lit.getValueAs(BigDecimal::class.java)!!.longValueExact()}L)"
             else -> throw UnsupportedOperationException("Unsupported literal type: ${lit.type.sqlTypeName}")
         }
@@ -191,24 +232,43 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
         type == SqlTypeName.DATE || type == SqlTypeName.TIME ||
             type == SqlTypeName.TIMESTAMP || type == SqlTypeName.TIMESTAMP_WITH_LOCAL_TIME_ZONE
 
-    private fun isApprox(type: SqlTypeName): Boolean =
-        type == SqlTypeName.DOUBLE || type == SqlTypeName.FLOAT || type == SqlTypeName.REAL
+    private fun sameBaseType(a: RelDataType, b: RelDataType): Boolean {
+        val ba = kotlinBaseType(a)
+        return ba != null && ba == kotlinBaseType(b)
+    }
+
+    private fun isNumeric(type: RelDataType): Boolean = numericFamily(type) != null
+
+    private fun numericFamily(type: RelDataType): Char? = when (type.sqlTypeName) {
+        SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER -> 'I'
+        SqlTypeName.BIGINT -> 'L'
+        SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE -> 'D'
+        SqlTypeName.DECIMAL -> if (type.scale > 0) 'D' else 'L'
+        else -> null
+    }
 
     private fun call(call: RexCall, ctx: RexContext): String {
         fun arg(i: Int) = expr(call.operands[i], ctx)
         fun helper(name: String) = "$name(${call.operands.joinToString(", ") { expr(it, ctx) }})"
 
         return when (call.kind) {
-            SqlKind.AND -> call.operands.map { expr(it, ctx) }.reduce { a, b -> "and3($a, $b)" }
-            SqlKind.OR -> call.operands.map { expr(it, ctx) }.reduce { a, b -> "or3($a, $b)" }
-            SqlKind.NOT -> "not3(${arg(0)})"
+            SqlKind.AND, SqlKind.OR -> {
+                val (native, helper3) = if (call.kind == SqlKind.AND) "&&" to "and3" else "||" to "or3"
+                if (call.operands.all { nn(it) }) {
+                    "(" + call.operands.joinToString(" $native ") { expr(it, ctx) } + ")"
+                } else {
+                    call.operands.map { expr(it, ctx) }.reduce { a, b -> "$helper3($a, $b)" }
+                }
+            }
+            SqlKind.NOT ->
+                if (nn(call.operands[0])) "!${parenthesize(arg(0))}" else "not3(${arg(0)})"
 
-            SqlKind.EQUALS -> helper("eq")
-            SqlKind.NOT_EQUALS -> helper("neq")
-            SqlKind.LESS_THAN -> helper("lt")
-            SqlKind.LESS_THAN_OR_EQUAL -> helper("lte")
-            SqlKind.GREATER_THAN -> helper("gt")
-            SqlKind.GREATER_THAN_OR_EQUAL -> helper("gte")
+            SqlKind.EQUALS -> comparison(call, "==", "eq", ctx)
+            SqlKind.NOT_EQUALS -> comparison(call, "!=", "neq", ctx)
+            SqlKind.LESS_THAN -> comparison(call, "<", "lt", ctx)
+            SqlKind.LESS_THAN_OR_EQUAL -> comparison(call, "<=", "lte", ctx)
+            SqlKind.GREATER_THAN -> comparison(call, ">", "gt", ctx)
+            SqlKind.GREATER_THAN_OR_EQUAL -> comparison(call, ">=", "gte", ctx)
             SqlKind.IS_NOT_DISTINCT_FROM -> helper("isNotDistinct")
             SqlKind.IS_DISTINCT_FROM -> helper("isDistinct")
 
@@ -223,77 +283,160 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             // dtPlus/dtMinus are Any?-typed, so cast back to the derived type.
             SqlKind.PLUS ->
                 if (isDatetime(call.type.sqlTypeName)) "(${helper("dtPlus")} as ${kotlinType(call.type)})"
-                else narrow(call, helper("numAdd"))
+                else arith(call, "+", "add", "numAdd", ctx)
             SqlKind.MINUS -> when {
                 isDatetime(call.type.sqlTypeName) -> "(${helper("dtMinus")} as ${kotlinType(call.type)})"
                 // `datetime - datetime` (MINUS_DATE operator, kind MINUS) yields an interval.
-                call.type.sqlTypeName in SqlTypeName.YEAR_INTERVAL_TYPES -> "dtDiffMonths(${arg(0)}, ${arg(1)})"
-                call.type.sqlTypeName in SqlTypeName.DAY_INTERVAL_TYPES -> "dtDiffDuration(${arg(0)}, ${arg(1)})"
-                else -> narrow(call, helper("numSub"))
+                call.type.sqlTypeName in SqlTypeName.YEAR_INTERVAL_TYPES ->
+                    nnWrap(call.type, "dtDiffMonths(${arg(0)}, ${arg(1)})")
+                call.type.sqlTypeName in SqlTypeName.DAY_INTERVAL_TYPES ->
+                    nnWrap(call.type, "dtDiffDuration(${arg(0)}, ${arg(1)})")
+                else -> arith(call, "-", "sub", "numSub", ctx)
             }
-            SqlKind.TIMES -> narrow(call, helper("numMul"))
-            SqlKind.DIVIDE -> narrow(call, helper("numDiv"))
-            SqlKind.MOD -> narrow(call, helper("numMod"))
-            SqlKind.MINUS_PREFIX -> narrow(call, "numNeg(${arg(0)})")
+            SqlKind.TIMES -> arith(call, "*", "mul", "numMul", ctx)
+            SqlKind.DIVIDE -> arith(call, "/", "div", "numDiv", ctx)
+            SqlKind.MOD -> arith(call, "%", "mod", "numMod", ctx)
+            SqlKind.MINUS_PREFIX ->
+                if (nn(call.operands[0]) && isNumeric(call.operands[0].type)) "(-${arg(0)})"
+                else arith(call, null, "neg", "numNeg", ctx)
             SqlKind.PLUS_PREFIX -> arg(0)
 
             SqlKind.EXTRACT -> {
                 val unit = (call.operands[0] as RexLiteral).getValueAs(TimeUnitRange::class.java)!!.name
-                "extractField(${kotlinString(unit)}, ${arg(1)})"
+                nnWrap(call.type, "extractField(${kotlinString(unit)}, ${arg(1)})")
             }
 
             SqlKind.FLOOR, SqlKind.CEIL -> {
                 // Two-operand form is FLOOR(datetime TO unit) — not supported.
                 require(call.operands.size == 1) { "FLOOR/CEIL with a time unit is not supported" }
-                val fn = if (call.kind == SqlKind.FLOOR) "numFloor" else "numCeil"
-                narrow(call, "$fn(${arg(0)})")
+                val op = call.operands[0]
+                if (nn(op) && numericFamily(op.type) == 'D' && numericFamily(call.type) == 'D') {
+                    val fn = if (call.kind == SqlKind.FLOOR) "floor" else "ceil"
+                    "kotlin.math.$fn(${arg(0)})"
+                } else {
+                    val fn = if (call.kind == SqlKind.FLOOR) "numFloor" else "numCeil"
+                    nnWrap(call.type, narrow(call, "$fn(${arg(0)})"))
+                }
             }
 
             SqlKind.CASE -> caseWhen(call, ctx)
             SqlKind.CAST -> cast(call, ctx)
 
-            SqlKind.LIKE -> helper("like")
+            SqlKind.LIKE -> nnWrap(call.type, helper("like"))
 
             else -> function(call, ctx)
         }
     }
 
+    /** Binary comparison: native operator for non-null compatible operands. */
+    private fun comparison(call: RexCall, op: String, helperName: String, ctx: RexContext): String {
+        val (a, b) = call.operands
+        val ordered = op !in setOf("==", "!=")
+        val native = nn(a) && nn(b) &&
+            if (ordered) {
+                // Kotlin allows mixed-numeric `<`/`>`, otherwise require one type.
+                (isNumeric(a.type) && isNumeric(b.type)) || sameBaseType(a.type, b.type)
+            } else {
+                // ==/!= must compare identical types (Int == Long is always false).
+                sameBaseType(a.type, b.type)
+            }
+        return if (native) {
+            "(${expr(a, ctx)} $op ${expr(b, ctx)})"
+        } else {
+            // The helper is Boolean?-typed; with non-null operands (e.g. Int
+            // vs Long, where native == would be always-false) coerce to match
+            // Calcite's NOT NULL derivation.
+            nnWrap(call.type, "$helperName(${expr(a, ctx)}, ${expr(b, ctx)})")
+        }
+    }
+
+    /**
+     * Arithmetic. All operands non-null -> native Kotlin operators (numeric
+     * promotion matches SQL's). One family, some nullable -> typed helper
+     * (`subD`). Mixed families with nulls -> generic Number helper + narrowing.
+     */
+    private fun arith(call: RexCall, sym: String?, typedName: String, genericName: String, ctx: RexContext): String {
+        val ops = call.operands
+        if (ops.all { nn(it) && isNumeric(it.type) } && numericFamily(call.type) != null) {
+            return if (sym == null) "(-${expr(ops[0], ctx)})"
+            else "(" + ops.joinToString(" $sym ") { expr(it, ctx) } + ")"
+        }
+        val family = numericFamily(call.type)
+        val args = ops.joinToString(", ") { expr(it, ctx) }
+        if (family != null && ops.all { numericFamily(it.type) == family }) {
+            return "$typedName$family($args)"
+        }
+        return nnWrap(call.type, narrow(call, "$genericName($args)"))
+    }
+
     /** Named functions and operators without a dedicated SqlKind. */
     private fun function(call: RexCall, ctx: RexContext): String {
         fun helper(name: String) = "$name(${call.operands.joinToString(", ") { expr(it, ctx) }})"
+        fun mathNative(fn: String): String {
+            val op = call.operands[0]
+            return if (nn(op) && numericFamily(op.type) == 'D') "kotlin.math.$fn(${expr(op, ctx)})"
+            else nnWrap(call.type, helper("num${fn.replaceFirstChar { it.uppercase() }}"))
+        }
+
+        /** String method call: native `.method()` with `?.` for nullable receivers. */
+        fun strMethod(method: String): String {
+            val op = call.operands[0]
+            val dot = if (nn(op)) "." else "?."
+            return "${parenthesize(expr(op, ctx))}$dot$method"
+        }
+
         return when (call.operator.name.uppercase()) {
-            "||", "CONCAT" -> helper("concatStr")
-            "UPPER" -> helper("upper")
-            "LOWER" -> helper("lower")
-            "CHAR_LENGTH", "CHARACTER_LENGTH", "LENGTH" -> helper("charLength")
-            "SUBSTRING" -> helper("substr")
-            "ABS" -> narrow(call, helper("sqlAbs"))
-            "MOD" -> narrow(call, helper("numMod"))
-            "POWER" -> narrow(call, helper("numPower"), doubleValued = true)
-            "SQRT" -> narrow(call, helper("numSqrt"), doubleValued = true)
-            "EXP" -> narrow(call, helper("numExp"), doubleValued = true)
-            "LN" -> narrow(call, helper("numLn"), doubleValued = true)
-            "LOG10" -> narrow(call, helper("numLog10"), doubleValued = true)
-            "SIN" -> narrow(call, helper("numSin"), doubleValued = true)
-            "COS" -> narrow(call, helper("numCos"), doubleValued = true)
-            "TAN" -> narrow(call, helper("numTan"), doubleValued = true)
-            "COT" -> narrow(call, helper("numCot"), doubleValued = true)
-            "ASIN" -> narrow(call, helper("numAsin"), doubleValued = true)
-            "ACOS" -> narrow(call, helper("numAcos"), doubleValued = true)
-            "ATAN" -> narrow(call, helper("numAtan"), doubleValued = true)
-            "ATAN2" -> narrow(call, helper("numAtan2"), doubleValued = true)
-            "DEGREES" -> narrow(call, helper("numDegrees"), doubleValued = true)
-            "RADIANS" -> narrow(call, helper("numRadians"), doubleValued = true)
-            "SIGN" -> narrow(call, helper("numSign"))
-            "ROUND" -> narrow(call, helper("numRound"))
-            "TRUNCATE" -> narrow(call, helper("numTruncate"))
+            "||", "CONCAT" -> {
+                val (a, b) = call.operands
+                if (nn(a) && nn(b)) "(${expr(a, ctx)} + ${expr(b, ctx)})" else helper("concatStr")
+            }
+            "UPPER" -> strMethod("uppercase()")
+            "LOWER" -> strMethod("lowercase()")
+            "CHAR_LENGTH", "CHARACTER_LENGTH", "LENGTH" -> strMethod("length")
+            "SUBSTRING" -> nnWrap(call.type, helper("substr"))
+            "ABS" -> {
+                val op = call.operands[0]
+                if (nn(op) && isNumeric(op.type)) "kotlin.math.abs(${expr(op, ctx)})"
+                else nnWrap(call.type, narrow(call, helper("sqlAbs")))
+            }
+            "MOD" -> arith(call, "%", "mod", "numMod", ctx)
+            "POWER" -> {
+                val (a, b) = call.operands
+                if (nn(a) && nn(b) && isNumeric(a.type) && isNumeric(b.type)) {
+                    "Math.pow(${toDouble(a, ctx)}, ${toDouble(b, ctx)})"
+                } else {
+                    helper("numPower")
+                }
+            }
+            "SQRT" -> mathNative("sqrt")
+            "EXP" -> mathNative("exp")
+            "LN" -> mathNative("ln")
+            "LOG10" -> mathNative("log10")
+            "SIN" -> mathNative("sin")
+            "COS" -> mathNative("cos")
+            "TAN" -> mathNative("tan")
+            "COT" -> nnWrap(call.type, helper("numCot"))
+            "ASIN" -> mathNative("asin")
+            "ACOS" -> mathNative("acos")
+            "ATAN" -> mathNative("atan")
+            "ATAN2" -> nnWrap(call.type, helper("numAtan2"))
+            "DEGREES" -> nnWrap(call.type, helper("numDegrees"))
+            "RADIANS" -> nnWrap(call.type, helper("numRadians"))
+            "SIGN" -> nnWrap(call.type, narrow(call, helper("numSign")))
+            "ROUND" -> nnWrap(call.type, narrow(call, helper("numRound")))
+            "TRUNCATE" -> nnWrap(call.type, narrow(call, helper("numTruncate")))
             "PI" -> "kotlin.math.PI"
-            "COALESCE" -> helper("coalesce") // normally rewritten to CASE by Calcite
+            "COALESCE" -> nnWrap(call.type, helper("coalesce")) // normally rewritten to CASE by Calcite
             "CURRENT_DATE" -> "java.time.LocalDate.now()"
             "CURRENT_TIMESTAMP", "LOCALTIMESTAMP" -> "java.time.LocalDateTime.now()"
             "CURRENT_TIME", "LOCALTIME" -> "java.time.LocalTime.now()"
             else -> throw UnsupportedOperationException("Unsupported SQL function/operator: ${call.operator.name}")
         }
+    }
+
+    private fun toDouble(node: RexNode, ctx: RexContext): String {
+        val e = expr(node, ctx)
+        return if (numericFamily(node.type) == 'D') e else "${parenthesize(e)}.toDouble()"
     }
 
     /**
@@ -302,19 +445,28 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
      */
     private fun caseWhen(call: RexCall, ctx: RexContext): String {
         val ops = call.operands
-        if (ops.size == 3) {
-            return "if (${condition(ops[0], ctx)}) ${expr(ops[1], ctx)} else ${expr(ops[2], ctx)}"
+        // Value operands: odd positions plus the trailing else.
+        val values = (1 until ops.size step 2).map { ops[it] } + ops.last()
+        val staticNullable = values.any { !nn(it) }
+
+        val text = if (ops.size == 3) {
+            "if (${condition(ops[0], ctx)}) ${expr(ops[1], ctx)} else ${expr(ops[2], ctx)}"
+        } else {
+            val inner = ctx.copy(indent = ctx.indent + "    ")
+            buildString {
+                append("when {\n")
+                var i = 0
+                while (i + 1 < ops.size) {
+                    append("${inner.indent}${condition(ops[i], inner)} -> ${expr(ops[i + 1], inner)}\n")
+                    i += 2
+                }
+                append("${inner.indent}else -> ${expr(ops.last(), inner)}\n")
+                append("${ctx.indent}}")
+            }
         }
-        val inner = ctx.copy(indent = ctx.indent + "    ")
-        val sb = StringBuilder("when {\n")
-        var i = 0
-        while (i + 1 < ops.size) {
-            sb.append("${inner.indent}${condition(ops[i], inner)} -> ${expr(ops[i + 1], inner)}\n")
-            i += 2
-        }
-        sb.append("${inner.indent}else -> ${expr(ops.last(), inner)}\n")
-        sb.append("${ctx.indent}}")
-        return sb.toString()
+        // Calcite can prove NOT NULL through IS NOT NULL guards that Kotlin
+        // type inference cannot see; coerce in that case.
+        return if (staticNullable && !call.type.isNullable) "($text)!!" else text
     }
 
     private fun cast(call: RexCall, ctx: RexContext): String {
@@ -331,61 +483,75 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
                 else -> {}
             }
         }
+
         val value = expr(op, ctx)
-        return when (target) {
-            SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER -> "asInt($value)"
-            SqlTypeName.BIGINT -> "asLong($value)"
-            SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE, SqlTypeName.DECIMAL -> "asDouble($value)"
-            SqlTypeName.CHAR, SqlTypeName.VARCHAR -> "asString($value)"
-            SqlTypeName.BOOLEAN -> "asBoolean($value)"
+        val dot = if (nn(op)) "." else "?."
+        val receiver = parenthesize(value)
+        val converted = when (target) {
+            SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER ->
+                if (isNumeric(op.type)) "$receiver${dot}toInt()" else "asInt($value)"
+            SqlTypeName.BIGINT ->
+                if (isNumeric(op.type)) "$receiver${dot}toLong()" else "asLong($value)"
+            SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE ->
+                if (isNumeric(op.type)) "$receiver${dot}toDouble()" else "asDouble($value)"
+            SqlTypeName.DECIMAL -> {
+                val fn = if (call.type.scale > 0) "toDouble" else "toLong"
+                if (isNumeric(op.type)) "$receiver$dot$fn()" else "as${fn.removePrefix("to")}($value)"
+            }
+            SqlTypeName.CHAR, SqlTypeName.VARCHAR -> "$receiver${dot}toString()"
+            SqlTypeName.BOOLEAN -> value // BOOLEAN can only be cast from BOOLEAN here
             SqlTypeName.DATE -> "asDate($value)"
             SqlTypeName.TIME -> "asTime($value)"
             SqlTypeName.TIMESTAMP -> "asTimestamp($value)"
             else -> throw UnsupportedOperationException("Unsupported CAST target type: $target")
         }
+        // The as*/native-?. paths are nullable; coerce when Calcite says NOT NULL.
+        val staticNullable = !nn(op) || converted.startsWith("as")
+        return if (staticNullable && !call.type.isNullable) "$converted!!" else converted
     }
 
     /**
-     * Numeric helpers compute in Long/Double; narrow the result back to the
-     * Kotlin type matching the SQL-derived type. Skipped when the helper is
-     * statically Double-valued and the target is approximate ([doubleValued]).
+     * Narrows a `Number?`-valued generic helper to the Kotlin type matching
+     * the SQL-derived type (still nullable; pair with [nnWrap] when needed).
      */
-    private fun narrow(call: RexCall, expr: String, doubleValued: Boolean = false): String =
-        when (call.type.sqlTypeName) {
-            SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER -> "asInt($expr)"
-            SqlTypeName.BIGINT -> "asLong($expr)"
-            SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE ->
-                if (doubleValued) expr else "asDouble($expr)"
-            SqlTypeName.DECIMAL ->
-                // Exact decimals are approximated with Double unless the value is integral.
-                if (call.type.scale > 0) {
-                    if (doubleValued) expr else "asDouble($expr)"
-                } else {
-                    "asLong($expr)"
-                }
-            else -> expr
-        }
+    private fun narrow(call: RexCall, expr: String): String = when (numericFamily(call.type)) {
+        'I' -> "asInt($expr)"
+        'L' -> "asLong($expr)"
+        'D' -> "asDouble($expr)"
+        else -> expr
+    }
 }
 
 /**
- * Kotlin type for a Calcite-derived [org.apache.calcite.rel.type.RelDataType].
- * All generated row properties are nullable: outer joins, SQL NULL semantics
- * and the untyped helper layer make non-null guarantees impractical.
+ * Kotlin type for a Calcite-derived [RelDataType], including nullability:
+ * Calcite tracks it precisely (NOT NULL columns, outer-join sides, expression
+ * derivation), and the generator preserves it so that non-null values get
+ * native Kotlin operators.
  */
-internal fun kotlinType(type: org.apache.calcite.rel.type.RelDataType): String = when (type.sqlTypeName) {
-    SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER -> "Int?"
-    SqlTypeName.BIGINT -> "Long?"
-    SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE -> "Double?"
-    SqlTypeName.DECIMAL -> if (type.scale > 0) "Double?" else "Long?"
-    SqlTypeName.CHAR, SqlTypeName.VARCHAR -> "String?"
-    SqlTypeName.BOOLEAN -> "Boolean?"
-    SqlTypeName.DATE -> "java.time.LocalDate?"
-    SqlTypeName.TIME -> "java.time.LocalTime?"
-    SqlTypeName.TIMESTAMP -> "java.time.LocalDateTime?"
-    in SqlTypeName.YEAR_INTERVAL_TYPES -> "java.time.Period?"
-    in SqlTypeName.DAY_INTERVAL_TYPES -> "java.time.Duration?"
-    else -> "Any?"
+internal fun kotlinType(type: RelDataType): String {
+    val base = kotlinBaseType(type) ?: return "Any?"
+    return if (type.isNullable) "$base?" else base
 }
+
+/** Base Kotlin type without nullability; null for unmapped SQL types. */
+internal fun kotlinBaseType(type: RelDataType): String? = when (type.sqlTypeName) {
+    SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER -> "Int"
+    SqlTypeName.BIGINT -> "Long"
+    SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE -> "Double"
+    SqlTypeName.DECIMAL -> if (type.scale > 0) "Double" else "Long"
+    SqlTypeName.CHAR, SqlTypeName.VARCHAR -> "String"
+    SqlTypeName.BOOLEAN -> "Boolean"
+    SqlTypeName.DATE -> "java.time.LocalDate"
+    SqlTypeName.TIME -> "java.time.LocalTime"
+    SqlTypeName.TIMESTAMP -> "java.time.LocalDateTime"
+    in SqlTypeName.YEAR_INTERVAL_TYPES -> "java.time.Period"
+    in SqlTypeName.DAY_INTERVAL_TYPES -> "java.time.Duration"
+    else -> null
+}
+
+private val DateStringClass = org.apache.calcite.util.DateString::class.java
+private val TimeStringClass = org.apache.calcite.util.TimeString::class.java
+private val TimestampStringClass = org.apache.calcite.util.TimestampString::class.java
 
 /** Kotlin string literal with escaping (including `$` to keep templates inert). */
 internal fun kotlinString(s: String): String = buildString {

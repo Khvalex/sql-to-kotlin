@@ -12,7 +12,7 @@ fun main(args: Array<String>) {
             TableDef(
                 "EMP",
                 listOf(
-                    Column("ID", SqlTypeName.INTEGER, nullable = false),
+                    Column("ID", SqlTypeName.INTEGER, nullable = false, unique = true),
                     Column("NAME", SqlTypeName.VARCHAR),
                     Column("DEPTNO", SqlTypeName.INTEGER),
                     Column("SALARY", SqlTypeName.DOUBLE),
@@ -21,7 +21,7 @@ fun main(args: Array<String>) {
             TableDef(
                 "DEPT",
                 listOf(
-                    Column("DEPTNO", SqlTypeName.INTEGER, nullable = false),
+                    Column("DEPTNO", SqlTypeName.INTEGER, nullable = false, unique = true),
                     Column("DNAME", SqlTypeName.VARCHAR),
                 ),
             ),
