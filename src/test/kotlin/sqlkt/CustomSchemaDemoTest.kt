@@ -18,7 +18,7 @@ class CustomSchemaDemoTest {
             TableDef(
                 "APPLICATIONS",
                 listOf(
-                    Column("ID", SqlTypeName.INTEGER, nullable = false),
+                    Column("ID", SqlTypeName.INTEGER, nullable = false, unique = true),
                     Column("CLIENTID", SqlTypeName.INTEGER),
                     Column("PRODUCTID", SqlTypeName.INTEGER),
                     Column("AMOUNT", SqlTypeName.DOUBLE),
@@ -27,7 +27,7 @@ class CustomSchemaDemoTest {
             TableDef(
                 "CLIENTS",
                 listOf(
-                    Column("ID", SqlTypeName.INTEGER, nullable = false),
+                    Column("ID", SqlTypeName.INTEGER, nullable = false, unique = true),
                     Column("REGION", SqlTypeName.VARCHAR),
                     Column("SEGMENT", SqlTypeName.VARCHAR),
                 ),
@@ -35,7 +35,7 @@ class CustomSchemaDemoTest {
             TableDef(
                 "PRODUCTS",
                 listOf(
-                    Column("ID", SqlTypeName.INTEGER, nullable = false),
+                    Column("ID", SqlTypeName.INTEGER, nullable = false, unique = true),
                     Column("CATEGORY", SqlTypeName.VARCHAR),
                 ),
             ),
@@ -78,7 +78,7 @@ class CustomSchemaDemoTest {
      * Generated (plus the runtime prelude in the same file):
      * ```
      * private data class ItemsRow(
-     *     val id: Int?,
+     *     val id: Int,
      *     val city: String?,
      *     val price: Double?,
      *     val area: Double?,
@@ -88,7 +88,7 @@ class CustomSchemaDemoTest {
      *     return tables.getValue("ITEMS")
      *         .map { r ->
      *             ItemsRow(
-     *                 r["ID"] as Int?,
+     *                 r["ID"] as Int,
      *                 r["CITY"] as String?,
      *                 r["PRICE"] as Double?,
      *                 r["AREA"] as Double?,
@@ -110,7 +110,7 @@ class CustomSchemaDemoTest {
                 TableDef(
                     "ITEMS",
                     listOf(
-                        Column("ID", SqlTypeName.INTEGER, nullable = false),
+                        Column("ID", SqlTypeName.INTEGER, nullable = false, unique = true),
                         Column("CITY", SqlTypeName.VARCHAR),
                         Column("PRICE", SqlTypeName.DOUBLE),
                         Column("AREA", SqlTypeName.DOUBLE),
@@ -146,8 +146,9 @@ class CustomSchemaDemoTest {
 
     /**
      * Correlated scalar sub-query: Calcite decorrelates the per-product AVG
-     * into a standalone aggregation (val grouped) joined back on productid
-     * with the amount > avgAmount predicate.
+     * into a standalone aggregation (val grouped); because a GROUP BY key is
+     * unique, the join back becomes an associateBy lookup map, and the
+     * amount > avgAmount predicate a plain filter.
      *
      * SQL (LIMIT is a literal — the converter bakes it in at generation time):
      * ```
@@ -164,42 +165,42 @@ class CustomSchemaDemoTest {
      * Generated (plus the runtime prelude in the same file):
      * ```
      * private data class ApplicationsRow(
-     *     val id: Int?,
+     *     val id: Int,
      *     val clientid: Int?,
      *     val productid: Int?,
      *     val amount: Double?,
      * )
      *
      * private data class ClientsRow(
-     *     val id: Int?,
+     *     val id: Int,
      *     val region: String?,
      *     val segment: String?,
      * )
      *
      * private data class JoinedRow(
-     *     val id: Int?,
+     *     val id: Int,
      *     val clientid: Int?,
      *     val productid: Int?,
      *     val amount: Double?,
-     *     val id2: Int?,
+     *     val id2: Int,
      *     val region: String?,
      *     val segment: String?,
      * )
      *
      * private data class ProductsRow(
-     *     val id: Int?,
+     *     val id: Int,
      *     val category: String?,
      * )
      *
      * private data class JoinedRow2(
-     *     val id: Int?,
+     *     val id: Int,
      *     val clientid: Int?,
      *     val productid: Int?,
      *     val amount: Double?,
-     *     val id2: Int?,
+     *     val id2: Int,
      *     val region: String?,
      *     val segment: String?,
-     *     val id3: Int?,
+     *     val id3: Int,
      *     val category: String?,
      * )
      *
@@ -214,21 +215,21 @@ class CustomSchemaDemoTest {
      * )
      *
      * private data class JoinedRow3(
-     *     val id: Int?,
+     *     val id: Int,
      *     val clientid: Int?,
      *     val productid: Int?,
      *     val amount: Double?,
-     *     val id2: Int?,
+     *     val id2: Int,
      *     val region: String?,
      *     val segment: String?,
-     *     val id3: Int?,
+     *     val id3: Int,
      *     val category: String?,
      *     val productid2: Int?,
      *     val avgAmount: Double?,
      * )
      *
      * private data class Row2(
-     *     val id: Int?,
+     *     val id: Int,
      *     val amount: Double?,
      *     val region: String?,
      *     val category: String?,
@@ -238,22 +239,28 @@ class CustomSchemaDemoTest {
      *     val applications = tables.getValue("APPLICATIONS")
      *         .map { r ->
      *             ApplicationsRow(
-     *                 r["ID"] as Int?,
+     *                 r["ID"] as Int,
      *                 r["CLIENTID"] as Int?,
      *                 r["PRODUCTID"] as Int?,
      *                 r["AMOUNT"] as Double?,
      *             )
      *         }
      *     val filtered = tables.getValue("CLIENTS")
-     *         .map { r -> ClientsRow(r["ID"] as Int?, r["REGION"] as String?, r["SEGMENT"] as String?) }
-     *         .filter { row -> truth(eq(row.segment, "affluent")) }
-     *     val joined = innerJoin(applications, filtered, on = { l, r -> truth(eq(l.clientid, r.id)) }) { l, r ->
-     *         JoinedRow(l.id, l.clientid, l.productid, l.amount, r.id, r.region, r.segment)
+     *         .map { r -> ClientsRow(r["ID"] as Int, r["REGION"] as String?, r["SEGMENT"] as String?) }
+     *         .filter { row -> row.segment == "affluent" }
+     *     val filteredById = filtered.associateBy { it.id }
+     *     val joined = applications.mapNotNull { l ->
+     *         l.clientid?.let { filteredById[it] }?.let { r ->
+     *             JoinedRow(l.id, l.clientid, l.productid, l.amount, r.id, r.region, r.segment)
+     *         }
      *     }
      *     val products = tables.getValue("PRODUCTS")
-     *         .map { r -> ProductsRow(r["ID"] as Int?, r["CATEGORY"] as String?) }
-     *     val joined2 = innerJoin(joined, products, on = { l, r -> truth(eq(l.productid, r.id)) }) { l, r ->
-     *         JoinedRow2(l.id, l.clientid, l.productid, l.amount, l.id2, l.region, l.segment, r.id, r.category)
+     *         .map { r -> ProductsRow(r["ID"] as Int, r["CATEGORY"] as String?) }
+     *     val productsById = products.associateBy { it.id }
+     *     val joined2 = joined.mapNotNull { l ->
+     *         l.productid?.let { productsById[it] }?.let { r ->
+     *             JoinedRow2(l.id, l.clientid, l.productid, l.amount, l.id2, l.region, l.segment, r.id, r.category)
+     *         }
      *     }
      *     val grouped = applications
      *         .filter { row -> row.productid != null }
@@ -265,22 +272,26 @@ class CustomSchemaDemoTest {
      *                 avgAmount = aggAvg(group.map { it.amount }),
      *             )
      *         }
-     *     val joined3 = innerJoin(joined2, grouped, on = { l, r -> truth(eq(l.productid, r.productid)) && truth(gt(l.amount, r.avgAmount)) }) { l, r ->
-     *         JoinedRow3(
-     *             l.id,
-     *             l.clientid,
-     *             l.productid,
-     *             l.amount,
-     *             l.id2,
-     *             l.region,
-     *             l.segment,
-     *             l.id3,
-     *             l.category,
-     *             r.productid,
-     *             r.avgAmount,
-     *         )
+     *     val groupedByProductid = grouped.associateBy { it.productid }
+     *     val joined3 = joined2.mapNotNull { l ->
+     *         l.productid?.let { groupedByProductid[it] }?.let { r ->
+     *             JoinedRow3(
+     *                 l.id,
+     *                 l.clientid,
+     *                 l.productid,
+     *                 l.amount,
+     *                 l.id2,
+     *                 l.region,
+     *                 l.segment,
+     *                 l.id3,
+     *                 l.category,
+     *                 r.productid,
+     *                 r.avgAmount,
+     *             )
+     *         }
      *     }
      *     return joined3
+     *         .filter { row -> truth(gt(row.amount, row.avgAmount)) }
      *         .map { row -> Row2(id = row.id, amount = row.amount, region = row.region, category = row.category) }
      *         .sortedWith(orderBy<Row2>({ it.amount }, asc = false, nullsFirst = true))
      *         .take(10)

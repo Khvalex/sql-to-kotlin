@@ -296,8 +296,9 @@ private fun dtDiffDuration(a: Any?, b: Any?): java.time.Duration? =
     if (a == null || b == null) null else java.time.Duration.between(toDateTime(b), toDateTime(a))
 
 /** `datetime - datetime` with a year-month interval result. */
-private fun dtDiffMonths(a: Any?, b: Any?): java.time.Period =
-    java.time.Period.ofMonths(java.time.temporal.ChronoUnit.MONTHS.between(toDateTime(b), toDateTime(a)).toInt())
+private fun dtDiffMonths(a: Any?, b: Any?): java.time.Period? =
+    if (a == null || b == null) null
+    else java.time.Period.ofMonths(java.time.temporal.ChronoUnit.MONTHS.between(toDateTime(b), toDateTime(a)).toInt())
 
 /** EXTRACT(unit FROM datetime); returns BIGINT (Long) per Calcite's typing. */
 private fun extractField(unit: String, x: Any?): Long? {
@@ -327,8 +328,16 @@ private fun extractField(unit: String, x: Any?): Long? {
     }
 }
 
-// Joins: typed variants. The combiner receives null for the missing side of
-// outer joins; the condition only ever sees actual candidate pairs.
+/**
+ * Composite hash-join key: null when any part is NULL, because a SQL equi-join
+ * never matches NULL keys (a null composite key is simply never probed).
+ */
+private fun joinKey(vararg parts: Any?): List<Any?>? =
+    if (parts.any { it == null }) null else parts.toList()
+
+// Nested-loop joins: fallbacks for non-equi conditions and RIGHT/FULL joins.
+// The combiner receives null for the missing side of outer joins; the
+// condition only ever sees actual candidate pairs.
 private fun <L, R, T> innerJoin(left: List<L>, right: List<R>, on: (L, R) -> Boolean, combine: (L, R) -> T): List<T> {
     val result = mutableListOf<T>()
     for (l in left) for (r in right) if (on(l, r)) result += combine(l, r)

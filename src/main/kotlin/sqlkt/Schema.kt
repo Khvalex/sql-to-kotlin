@@ -13,6 +13,12 @@ data class Column(
     val name: String,
     val type: SqlTypeName,
     val nullable: Boolean = true,
+    /**
+     * Declares that values are unique within the table (e.g. a primary key).
+     * Lets the generator build hash-join lookup maps with `associateBy`
+     * instead of `groupBy` when this column is the join key.
+     */
+    val unique: Boolean = false,
 )
 
 data class TableDef(
