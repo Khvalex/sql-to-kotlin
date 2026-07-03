@@ -51,7 +51,10 @@ class RelToKotlin(private val rex: RexToKotlin) {
     /** Emits the data class declarations and the function body; returns (decls, function). */
     fun generate(rel: RelNode, fieldNames: List<String>, functionName: String): Pair<String, String> {
         countScans(rel)
-        out.append("fun $functionName(tables: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>> {\n")
+        out.append(
+            "fun $functionName(tables: Map<String, List<Map<String, Any?>>>, " +
+                "params: List<Any?> = emptyList()): List<Map<String, Any?>> {\n",
+        )
         val chain = visit(rel)
         chain.segments += finalMapSegment(fieldNames, chain.rowClass)
         out.append("${I1}return ${chain.head}\n")

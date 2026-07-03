@@ -24,6 +24,7 @@ object GeneratedCodeRunner {
     fun compileAndRun(
         source: String,
         tables: Map<String, List<Map<String, Any?>>>,
+        params: List<Any?> = emptyList(),
     ): List<Map<String, Any?>> {
         val dir = Files.createTempDirectory("sqlkt-gen-${counter.incrementAndGet()}-")
         val srcFile = dir.resolve("Query.kt").toFile()
@@ -47,9 +48,9 @@ object GeneratedCodeRunner {
 
         URLClassLoader(arrayOf(outDir.toURI().toURL()), javaClass.classLoader).use { loader ->
             val cls = loader.loadClass("generated.QueryKt")
-            val method = cls.getMethod("query", Map::class.java)
+            val method = cls.getMethod("query", Map::class.java, List::class.java)
             @Suppress("UNCHECKED_CAST")
-            return method.invoke(null, tables) as List<Map<String, Any?>>
+            return method.invoke(null, tables, params) as List<Map<String, Any?>>
         }
     }
 }
