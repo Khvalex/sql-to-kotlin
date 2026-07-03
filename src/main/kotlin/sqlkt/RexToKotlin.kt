@@ -163,12 +163,8 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             SqlTypeName.BIGINT -> "${lit.getValueAs(Long::class.javaObjectType)}L"
             SqlTypeName.DECIMAL -> {
                 val v = lit.getValueAs(BigDecimal::class.java)!!
-                if (v.scale() <= 0) {
-                    val l = v.longValueExact()
-                    if (l in Int.MIN_VALUE..Int.MAX_VALUE) l.toString() else "${l}L"
-                } else {
-                    v.toDouble().toString()
-                }
+                // Integral DECIMAL maps to Long (see kotlinType), so suffix with L.
+                if (v.scale() <= 0) "${v.longValueExact()}L" else v.toDouble().toString()
             }
             SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE ->
                 lit.getValueAs(Double::class.javaObjectType).toString()
@@ -224,10 +220,12 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             SqlKind.IS_NOT_FALSE -> "(${arg(0)} != false)"
 
             // `datetime + interval` keeps the PLUS/MINUS kind but a datetime type.
+            // dtPlus/dtMinus are Any?-typed, so cast back to the derived type.
             SqlKind.PLUS ->
-                if (isDatetime(call.type.sqlTypeName)) helper("dtPlus") else narrow(call, helper("numAdd"))
+                if (isDatetime(call.type.sqlTypeName)) "(${helper("dtPlus")} as ${kotlinType(call.type)})"
+                else narrow(call, helper("numAdd"))
             SqlKind.MINUS -> when {
-                isDatetime(call.type.sqlTypeName) -> helper("dtMinus")
+                isDatetime(call.type.sqlTypeName) -> "(${helper("dtMinus")} as ${kotlinType(call.type)})"
                 // `datetime - datetime` (MINUS_DATE operator, kind MINUS) yields an interval.
                 call.type.sqlTypeName in SqlTypeName.YEAR_INTERVAL_TYPES -> "dtDiffMonths(${arg(0)}, ${arg(1)})"
                 call.type.sqlTypeName in SqlTypeName.DAY_INTERVAL_TYPES -> "dtDiffDuration(${arg(0)}, ${arg(1)})"
@@ -367,6 +365,26 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
                 }
             else -> expr
         }
+}
+
+/**
+ * Kotlin type for a Calcite-derived [org.apache.calcite.rel.type.RelDataType].
+ * All generated row properties are nullable: outer joins, SQL NULL semantics
+ * and the untyped helper layer make non-null guarantees impractical.
+ */
+internal fun kotlinType(type: org.apache.calcite.rel.type.RelDataType): String = when (type.sqlTypeName) {
+    SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER -> "Int?"
+    SqlTypeName.BIGINT -> "Long?"
+    SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE -> "Double?"
+    SqlTypeName.DECIMAL -> if (type.scale > 0) "Double?" else "Long?"
+    SqlTypeName.CHAR, SqlTypeName.VARCHAR -> "String?"
+    SqlTypeName.BOOLEAN -> "Boolean?"
+    SqlTypeName.DATE -> "java.time.LocalDate?"
+    SqlTypeName.TIME -> "java.time.LocalTime?"
+    SqlTypeName.TIMESTAMP -> "java.time.LocalDateTime?"
+    in SqlTypeName.YEAR_INTERVAL_TYPES -> "java.time.Period?"
+    in SqlTypeName.DAY_INTERVAL_TYPES -> "java.time.Duration?"
+    else -> "Any?"
 }
 
 /** Kotlin string literal with escaping (including `$` to keep templates inert). */

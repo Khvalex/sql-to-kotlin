@@ -31,55 +31,82 @@ ORDER BY avg_sal DESC
 LIMIT 10
 ```
 
-Выход (тело `query`, плюс приватная рантайм-прелюдия в том же файле):
+Выход (плюс приватная рантайм-прелюдия в том же файле):
 
 ```kotlin
+private data class EmpRow(
+    val id: Int?,
+    val name: String?,
+    val deptno: Int?,
+    val salary: Double?,
+)
+
+private data class DeptRow(
+    val deptno: Int?,
+    val dname: String?,
+)
+
+private data class JoinedRow(
+    val id: Int?,
+    val name: String?,
+    val deptno: Int?,
+    val salary: Double?,
+    val deptno0: Int?,
+    val dname: String?,
+)
+
+private data class Row(
+    val dname: String?,
+    val salary: Double?,
+)
+
+private data class GroupedRow(
+    val dname: String?,
+    val cnt: Long?,
+    val avgSal: Double?,
+)
+
 fun query(tables: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>> {
     val emp = tables.getValue("EMP")
-        .map { r -> listOf<Any?>(r["ID"], r["NAME"], r["DEPTNO"], r["SALARY"]) }
+        .map { r ->
+            EmpRow(
+                r["ID"] as Int?,
+                r["NAME"] as String?,
+                r["DEPTNO"] as Int?,
+                r["SALARY"] as Double?,
+            )
+        }
     val dept = tables.getValue("DEPT")
-        .map { r -> listOf<Any?>(r["DEPTNO"], r["DNAME"]) }
-    val joined = joinRows(emp, dept, leftArity = 4, rightArity = 2, JoinType.INNER) { row ->
-        val deptno = row[2]
-        val deptno2 = row[4]
-        truth(eq(deptno, deptno2))
+        .map { r -> DeptRow(r["DEPTNO"] as Int?, r["DNAME"] as String?) }
+    val joined = innerJoin(emp, dept, on = { l, r -> truth(eq(l.deptno, r.deptno)) }) { l, r ->
+        JoinedRow(l.id, l.name, l.deptno, l.salary, r.deptno, r.dname)
     }
     return joined
-        .filter { row ->
-            val salary = row[3]
-            truth(gt(salary, 500.0))
-        }
-        .map { row ->
-            val salary = row[3]
-            val dname = row[5]
-            listOf<Any?>(
-                dname,
-                salary,
+        .filter { row -> truth(gt(row.salary, 500.0)) }
+        .map { row -> Row(dname = row.dname, salary = row.salary) }
+        .groupBy { row -> row.dname }
+        .map { (dname, group) ->
+            GroupedRow(
+                dname = dname,
+                cnt = group.size.toLong(),
+                avgSal = aggAvg(group.map { it.salary }),
             )
         }
-        .groupBy { row -> listOf(row[0]) } // GROUP BY DNAME
-        .map { (key, group) ->
-            key + listOf<Any?>(
-                group.size.toLong(), // COUNT(*)
-                aggAvg(group.map { it[1] }), // AVG(SALARY)
-            )
-        }
-        .filter { row ->
-            val cnt = row[1]
-            truth(gte(cnt, 1))
-        }
-        .sortedWith(rowComparator(listOf(SortKey(2, asc = false, nullsFirst = true)))) // ORDER BY AVG_SAL DESC
+        .filter { row -> truth(gte(row.cnt, 1)) }
+        .sortedWith(orderBy<GroupedRow>({ it.avgSal }, asc = false, nullsFirst = true))
         .take(10)
-        .map { row -> mapOf("DNAME" to row[0], "CNT" to row[1], "AVG_SAL" to row[2]) }
+        .map { row -> mapOf("DNAME" to row.dname, "CNT" to row.cnt, "AVG_SAL" to row.avgSal) }
 }
 ```
 
-Генератор старается выдавать код, который можно читать глазами: колонки
-раскрываются в именованные локальные `val`, линейные цепочки операторов
-эмитятся fluent-цепочкой, повторяющиеся подвыражения выносятся в один `val`
-(алиас колонки становится его именем), таблицы, сканируемые дважды,
-материализуются один раз, `GROUP BY`/`ORDER BY`/агрегаты аннотируются
-комментариями.
+Генератор выдаёт типобезопасный и читаемый код: на каждую границу оператора
+из `RelDataType` (типы уже вывел валидатор Calcite) генерируется `data class`,
+так что выражения читаются как `row.salary`, а не `row[3]`; линейные операторы
+эмитятся fluent-цепочкой; join'ы типизированы (`innerJoin`/`leftJoin`/...);
+повторяющиеся подвыражения выносятся в один `val` с именем алиаса колонки;
+таблицы, сканируемые дважды, материализуются один раз. Все свойства строк
+nullable — это осознанно: внешние join'ы и SQL NULL-семантика делают non-null
+гарантии непрактичными.
 
 ## Архитектура
 
@@ -99,21 +126,23 @@ fun query(tables: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>>
    выражения посередине вызова и не поддавался настройке, поэтому ради
    читаемости вывода от него отказались.
 
-Строки внутри конвейера позиционные (`List<Any?>`) — `RexInputRef(i)` дословно
-превращается в `row[i]`, разрешение имён не нужно. SQL-семантика (трёхзначная
+Строки внутри конвейера — сгенерированные `data class` (по одному на форму
+строки; одинаковые формы переиспользуют класс): `RexInputRef(i)` превращается
+в `row.<имя поля>` по позициям `RelDataType`. SQL-семантика (трёхзначная
 логика, null-propagating сравнения/арифметика, joins, агрегаты, LIKE,
 NULLS FIRST/LAST) реализована рантайм-прелюдией, дописываемой в конец каждого
 сгенерированного файла.
 
 | RelNode | Kotlin |
 |---|---|
-| TableScan | `tables.getValue("T").map { ... }` → позиционные строки |
+| TableScan | `tables.getValue("T").map { r -> EmpRow(r["ID"] as Int?, ...) }` |
 | Filter | `.filter { row -> truth(...) }` |
-| Project | `.map { row -> listOf(...) }` |
-| Join (inner/left/right/full/semi/anti) | `joinRows(...)` из прелюдии |
-| Aggregate | `.groupBy { ... }.map { (key, group) -> ... }`; глобальный агрегат — одна строка даже на пустом входе |
-| Sort + limit/offset | `.sortedWith(rowComparator(...))` + `.drop(n).take(m)` |
-| Values / Union | `listOf(...)` / конкатенация (+ `.distinct()`) |
+| Project | `.map { row -> Row(name = row.name, ...) }` |
+| Join (inner/left/right/full) | `innerJoin(l, r, on = { l, r -> ... }) { l, r -> JoinedRow(...) }` |
+| Join (semi/anti) | `semiJoin(l, r) { l, r -> ... }` — тип строки левой стороны |
+| Aggregate | `.groupBy { row -> row.key }.map { (key, group) -> GroupedRow(...) }`; глобальный агрегат — одна строка даже на пустом входе |
+| Sort + limit/offset | `.sortedWith(orderBy<Row>({ it.x }, ...).thenOrderBy(...))` + `.drop(n).take(m)` |
+| Values / Union | `listOf(ValuesRow(...))` / конкатенация (+ `.distinct()`) |
 
 ## Что поддержано
 

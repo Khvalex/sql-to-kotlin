@@ -121,7 +121,7 @@ private fun sqlAbs(a: Any?): Number? {
     }
 }
 
-private fun coalesce(vararg values: Any?): Any? = values.firstOrNull { it != null }
+private fun <T : Any> coalesce(vararg values: T?): T? = values.firstOrNull { it != null }
 
 // Math functions. Transcendentals compute in Double; the generated code narrows
 // results back to the SQL-derived type via asInt/asLong/asDouble.
@@ -303,70 +303,61 @@ private fun extractField(unit: String, x: Any?): Long? {
     }
 }
 
-// Joins. A row of the joined relation is the concatenation of a left row and a
-// right row; the condition sees that concatenated row (matching Calcite's
-// convention for join conditions).
-private enum class JoinType { INNER, LEFT, RIGHT, FULL, SEMI, ANTI }
+// Joins: typed variants. The combiner receives null for the missing side of
+// outer joins; the condition only ever sees actual candidate pairs.
+private fun <L, R, T> innerJoin(left: List<L>, right: List<R>, on: (L, R) -> Boolean, combine: (L, R) -> T): List<T> {
+    val result = mutableListOf<T>()
+    for (l in left) for (r in right) if (on(l, r)) result += combine(l, r)
+    return result
+}
 
-private fun joinRows(
-    left: List<List<Any?>>,
-    right: List<List<Any?>>,
-    leftArity: Int,
-    rightArity: Int,
-    type: JoinType,
-    cond: (List<Any?>) -> Boolean,
-): List<List<Any?>> {
-    val result = mutableListOf<List<Any?>>()
-    when (type) {
-        JoinType.SEMI -> left.filterTo(result) { l -> right.any { r -> cond(l + r) } }
-        JoinType.ANTI -> left.filterTo(result) { l -> right.none { r -> cond(l + r) } }
-        JoinType.INNER, JoinType.LEFT -> {
-            for (l in left) {
-                var matched = false
-                for (r in right) {
-                    val row = l + r
-                    if (cond(row)) {
-                        matched = true
-                        result += row
-                    }
-                }
-                if (!matched && type == JoinType.LEFT) result += l + arrayOfNulls<Any?>(rightArity)
-            }
+private fun <L, R, T> leftJoin(left: List<L>, right: List<R>, on: (L, R) -> Boolean, combine: (L, R?) -> T): List<T> {
+    val result = mutableListOf<T>()
+    for (l in left) {
+        var matched = false
+        for (r in right) if (on(l, r)) {
+            matched = true
+            result += combine(l, r)
         }
-        JoinType.RIGHT -> {
-            for (r in right) {
-                var matched = false
-                for (l in left) {
-                    val row = l + r
-                    if (cond(row)) {
-                        matched = true
-                        result += row
-                    }
-                }
-                if (!matched) result += List<Any?>(leftArity) { null } + r
-            }
-        }
-        JoinType.FULL -> {
-            val rightMatched = BooleanArray(right.size)
-            for (l in left) {
-                var matched = false
-                for ((ri, r) in right.withIndex()) {
-                    val row = l + r
-                    if (cond(row)) {
-                        matched = true
-                        rightMatched[ri] = true
-                        result += row
-                    }
-                }
-                if (!matched) result += l + arrayOfNulls<Any?>(rightArity)
-            }
-            for ((ri, r) in right.withIndex()) {
-                if (!rightMatched[ri]) result += List<Any?>(leftArity) { null } + r
-            }
-        }
+        if (!matched) result += combine(l, null)
     }
     return result
 }
+
+private fun <L, R, T> rightJoin(left: List<L>, right: List<R>, on: (L, R) -> Boolean, combine: (L?, R) -> T): List<T> {
+    val result = mutableListOf<T>()
+    for (r in right) {
+        var matched = false
+        for (l in left) if (on(l, r)) {
+            matched = true
+            result += combine(l, r)
+        }
+        if (!matched) result += combine(null, r)
+    }
+    return result
+}
+
+private fun <L, R, T> fullJoin(left: List<L>, right: List<R>, on: (L, R) -> Boolean, combine: (L?, R?) -> T): List<T> {
+    val result = mutableListOf<T>()
+    val rightMatched = BooleanArray(right.size)
+    for (l in left) {
+        var matched = false
+        for ((ri, r) in right.withIndex()) if (on(l, r)) {
+            matched = true
+            rightMatched[ri] = true
+            result += combine(l, r)
+        }
+        if (!matched) result += combine(l, null)
+    }
+    for ((ri, r) in right.withIndex()) if (!rightMatched[ri]) result += combine(null, r)
+    return result
+}
+
+private fun <L, R> semiJoin(left: List<L>, right: List<R>, on: (L, R) -> Boolean): List<L> =
+    left.filter { l -> right.any { r -> on(l, r) } }
+
+private fun <L, R> antiJoin(left: List<L>, right: List<R>, on: (L, R) -> Boolean): List<L> =
+    left.filter { l -> right.none { r -> on(l, r) } }
 
 // Aggregate functions. SQL semantics: nulls are ignored; SUM/AVG/MIN/MAX over
 // an empty (or all-null) set yield NULL, COUNT yields 0.
@@ -390,21 +381,19 @@ private fun aggAvg(values: List<Any?>): Double? {
     return nonNull.sumOf { it.toDouble() } / nonNull.size
 }
 
-private fun aggMin(values: List<Any?>): Any? =
+private fun <T : Any> aggMin(values: List<T?>): T? =
     values.filterNotNull().minWithOrNull { a, b -> cmp(a, b)!! }
 
-private fun aggMax(values: List<Any?>): Any? =
+private fun <T : Any> aggMax(values: List<T?>): T? =
     values.filterNotNull().maxWithOrNull { a, b -> cmp(a, b)!! }
 
 /** Scalar sub-query result: at most one row is allowed. */
-private fun aggSingleValue(values: List<Any?>): Any? {
+private fun <T> aggSingleValue(values: List<T>): T? {
     require(values.size <= 1) { "Scalar sub-query returned more than one row" }
     return values.firstOrNull()
 }
 
 // ORDER BY.
-private class SortKey(val index: Int, val asc: Boolean, val nullsFirst: Boolean)
-
 private fun orderCmp(a: Any?, b: Any?, asc: Boolean, nullsFirst: Boolean): Int {
     if (a == null && b == null) return 0
     if (a == null) return if (nullsFirst) -1 else 1
@@ -413,11 +402,9 @@ private fun orderCmp(a: Any?, b: Any?, asc: Boolean, nullsFirst: Boolean): Int {
     return if (asc) c else -c
 }
 
-private fun rowComparator(keys: List<SortKey>): Comparator<List<Any?>> = Comparator { a, b ->
-    for (k in keys) {
-        val c = orderCmp(a[k.index], b[k.index], k.asc, k.nullsFirst)
-        if (c != 0) return@Comparator c
-    }
-    0
-}
+private fun <T> orderBy(selector: (T) -> Any?, asc: Boolean, nullsFirst: Boolean): Comparator<T> =
+    Comparator { a, b -> orderCmp(selector(a), selector(b), asc, nullsFirst) }
+
+private fun <T> Comparator<T>.thenOrderBy(selector: (T) -> Any?, asc: Boolean, nullsFirst: Boolean): Comparator<T> =
+    thenComparing(orderBy(selector, asc, nullsFirst))
 """

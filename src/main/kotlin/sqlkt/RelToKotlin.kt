@@ -12,6 +12,7 @@ import org.apache.calcite.rel.core.Sort
 import org.apache.calcite.rel.core.TableScan
 import org.apache.calcite.rel.core.Union
 import org.apache.calcite.rel.core.Values
+import org.apache.calcite.rel.type.RelDataType
 import org.apache.calcite.rex.RexLiteral
 import org.apache.calcite.rex.RexNode
 import org.apache.calcite.sql.SqlKind
@@ -21,40 +22,53 @@ private const val I1 = "    " // statement indent inside the function
 private const val I2 = "        " // chained operator indent
 
 /**
- * Walks a [RelNode] tree bottom-up and emits idiomatic-looking Kotlin:
- * linear operator runs become one fluent collection chain, joins/unions
- * materialize into named `val`s, columns get named locals inside lambdas
- * (`val salary = row[3]`), and subexpressions repeated within a projection
- * are extracted into a single local.
+ * Walks a [RelNode] tree bottom-up and emits typed, idiomatic-looking Kotlin.
+ *
+ * Every operator boundary gets a generated `data class` derived from Calcite's
+ * validated row type, so expressions read `row.salary` instead of `row[3]`.
+ * Linear operator runs become one fluent collection chain; joins/unions and
+ * twice-scanned tables materialize into named `val`s; subexpressions repeated
+ * within a projection are extracted into a single local.
  */
 class RelToKotlin(private val rex: RexToKotlin) {
 
-    /** A fluent chain: head expression plus `.op(...)` segments (absolute-indented lines). */
-    private class Chain(val head: String, val segments: MutableList<String> = mutableListOf())
+    /** A generated row data class: property names/types parallel the field indexes. */
+    private class RowClass(val name: String, val props: List<String>, val types: List<String>)
+
+    /** A fluent chain: head expression plus `.op(...)` segments producing [rowClass] rows. */
+    private class Chain(val head: String, var rowClass: RowClass, val segments: MutableList<String> = mutableListOf())
 
     private val out = StringBuilder()
-    private val usedNames = mutableMapOf<String, Int>()
+    private val decls = StringBuilder()
+    private val usedVarNames = mutableMapOf<String, Int>()
+    private val usedClassNames = mutableMapOf<String, Int>()
+    private val classBySignature = mutableMapOf<String, RowClass>()
 
     /** Tables scanned more than once are materialized into one shared `val`. */
     private val scanCounts = mutableMapOf<String, Int>()
-    private val scanVars = mutableMapOf<String, String>()
+    private val scanVars = mutableMapOf<String, Chain>()
 
-    /** Emits the whole function body (statements + return). */
-    fun generate(rel: RelNode, fieldNames: List<String>, functionName: String): String {
+    /** Emits the data class declarations and the function body; returns (decls, function). */
+    fun generate(rel: RelNode, fieldNames: List<String>, functionName: String): Pair<String, String> {
         countScans(rel)
         out.append("fun $functionName(tables: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>> {\n")
         val chain = visit(rel)
-        chain.segments += mapToRowsSegment(fieldNames)
+        chain.segments += finalMapSegment(fieldNames, chain.rowClass)
         out.append("${I1}return ${chain.head}\n")
         chain.segments.forEach { out.append(it) }
         out.append("}\n")
-        return out.toString()
+        return decls.toString() to out.toString()
     }
 
     // ------------------------------------------------------------------ util
 
-    private fun freshName(base: String): String {
-        val n = usedNames.merge(base, 1, Int::plus)!!
+    private fun freshVar(base: String): String {
+        val n = usedVarNames.merge(base, 1, Int::plus)!!
+        return if (n == 1) base else "$base$n"
+    }
+
+    private fun freshClassName(base: String): String {
+        val n = usedClassNames.merge(base, 1, Int::plus)!!
         return if (n == 1) base else "$base$n"
     }
 
@@ -63,7 +77,7 @@ class RelToKotlin(private val rex: RexToKotlin) {
         if (chain.segments.isEmpty() && chain.head.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))) {
             return chain.head
         }
-        val name = freshName(base)
+        val name = freshVar(base)
         out.append("${I1}val $name = ${chain.head}\n")
         chain.segments.forEach { out.append(it) }
         return name
@@ -74,14 +88,16 @@ class RelToKotlin(private val rex: RexToKotlin) {
         "interface", "is", "null", "object", "package", "return", "super", "this", "throw",
         "true", "try", "typealias", "val", "var", "when", "while",
         // names already used by the generated code and prelude
-        "row", "key", "group", "tables", "it", "r", "truth",
+        "row", "key", "group", "tables", "it", "r", "l", "truth",
     )
 
-    /** SQL field name -> Kotlin local: DEV_PCT -> devPct, $f0 -> f0. */
+    /** SQL field name -> Kotlin identifier: DEV_PCT -> devPct, $f0 -> f0, devPct -> devPct. */
     private fun localName(field: String, taken: MutableSet<String>): String {
         val parts = field.split(Regex("[^A-Za-z0-9]+")).filter { it.isNotEmpty() }
         var name = parts.withIndex().joinToString("") { (i, p) ->
-            if (i == 0) p.lowercase() else p.lowercase().replaceFirstChar { it.uppercase() }
+            // Mixed-case parts are already camelCase — keep them as-is.
+            val base = if (p.any { it.isLowerCase() } && p.any { it.isUpperCase() }) p else p.lowercase()
+            if (i == 0) base.replaceFirstChar { it.lowercase() } else base.replaceFirstChar { it.uppercase() }
         }.ifEmpty { "col" }
         if (name.first().isDigit()) name = "c$name"
         if (name in kotlinKeywords) name += "_"
@@ -91,50 +107,65 @@ class RelToKotlin(private val rex: RexToKotlin) {
         return unique
     }
 
+    /** Gets or creates the data class for a row shape. Identical shapes share one class. */
+    private fun rowClassOf(fieldNames: List<String>, types: List<String>, hint: String): RowClass {
+        val taken = mutableSetOf<String>()
+        val props = fieldNames.map { localName(it, taken) }
+        val signature = props.zip(types).joinToString(";") { "${it.first}:${it.second}" }
+        classBySignature[signature]?.let { return it }
+
+        val cls = RowClass(freshClassName(hint), props, types)
+        decls.append("private data class ${cls.name}(\n")
+        props.zip(types).forEach { (p, t) -> decls.append("    val $p: $t,\n") }
+        decls.append(")\n\n")
+        classBySignature[signature] = cls
+        return cls
+    }
+
+    private fun rowClassOf(rowType: RelDataType, hint: String): RowClass =
+        rowClassOf(rowType.fieldNames, rowType.fieldList.map { kotlinType(it.type) }, hint)
+
+    /** Bindings for a lambda over [cls] rows: field index -> `param.prop`. */
+    private fun bindings(param: String, cls: RowClass): Map<Int, String> =
+        cls.props.withIndex().associate { (i, p) -> i to "$param.$p" }
+
     /**
-     * Local `val` declarations for a lambda: bindings for every referenced
-     * column plus extracted common subexpressions.
+     * Locals for common subexpressions repeated across [exprs], named after the
+     * projected alias when the subexpression IS a projected column.
      */
-    private fun lambdaPrelude(
+    private fun sharedLocals(
         exprs: List<RexNode>,
-        inputFields: List<String>,
-        outputFields: List<String?> = emptyList(),
+        base: RexContext,
+        outputProps: List<String?> = emptyList(),
         indent: String,
     ): Pair<List<String>, RexContext> {
-        val taken = mutableSetOf<String>()
+        val taken = mutableSetOf("row", "key", "group", "l", "r", "it")
         val lines = mutableListOf<String>()
-
-        val bindings = mutableMapOf<Int, String>()
-        for (i in exprs.flatMap { rex.inputRefs(it) }.toSortedSet()) {
-            val name = localName(inputFields.getOrElse(i) { "col$i" }, taken)
-            bindings[i] = name
-            lines += "${indent}val $name = row[$i]"
-        }
-
-        var shared = mapOf<String, String>()
+        var shared = base.shared
         for (node in rex.sharedSubtrees(exprs)) {
             val digest = node.toString()
-            // Prefer the projection alias when the shared subtree IS a projected column.
             val alias = exprs.indexOfFirst { it.toString() == digest }
-                .let { outputFields.getOrNull(it) }
-                ?.takeUnless { it.startsWith("EXPR$") || it.startsWith("\$f") }
+                .let { outputProps.getOrNull(it) }
             val name = localName(alias ?: "shared", taken)
-            val ctx = RexContext(bindings, shared, indent)
-            lines += "${indent}val $name = ${rex.expr(node, ctx)}"
+            lines += "${indent}val $name = ${rex.expr(node, base.copy(shared = shared, indent = indent))}"
             shared = shared + (digest to name)
         }
-        return lines to RexContext(bindings, shared, indent)
+        return lines to base.copy(shared = shared, indent = indent)
     }
 
     // ------------------------------------------------------------- operators
 
     private fun visit(rel: RelNode): Chain = when (rel) {
         is TableScan -> tableScan(rel)
-        is Filter -> visit(rel.input).also { it.segments += filterSegment(rel) }
-        is Project -> visit(rel.input).also { it.segments += projectSegment(rel) }
+        is Filter -> visit(rel.input).also { it.segments += filterSegment(rel, it.rowClass) }
+        is Project -> visit(rel.input).also {
+            val (segment, outCls) = projectSegment(rel.projects, rel.rowType, it.rowClass)
+            it.segments += segment
+            it.rowClass = outCls
+        }
         is Join -> join(rel)
         is Aggregate -> aggregate(rel)
-        is Sort -> visit(rel.input).also { it.segments += sortSegments(rel) }
+        is Sort -> visit(rel.input).also { it.segments += sortSegments(rel, it.rowClass) }
         is Values -> values(rel)
         is Union -> union(rel)
         else -> throw UnsupportedOperationException("Unsupported relational operator ${rel.relTypeName}: $rel")
@@ -147,153 +178,207 @@ class RelToKotlin(private val rex: RexToKotlin) {
 
     private fun tableScan(rel: TableScan): Chain {
         val tableName = rel.table!!.qualifiedName.last()
-        scanVars[tableName]?.let { return Chain(it) }
-        val cells = rel.rowType.fieldNames.map { "r[${kotlinString(it)}]" }
-        val oneLine = "$I2.map { r -> listOf<Any?>(${cells.joinToString(", ")}) }\n"
-        val segment = if (oneLine.length <= 100) oneLine else buildString {
+        scanVars[tableName]?.let { return Chain(it.head, it.rowClass) }
+
+        val hint = tableName.lowercase().replaceFirstChar { it.uppercase() } + "Row"
+        val cls = rowClassOf(rel.rowType, hint)
+        val cells = rel.rowType.fieldNames.mapIndexed { i, f -> "r[${kotlinString(f)}] as ${cls.types[i]}" }
+
+        val oneLine = "$I2.map { r -> ${cls.name}(${cells.joinToString(", ")}) }\n"
+        val segment = if (oneLine.length <= 110) oneLine else buildString {
             append("$I2.map { r ->\n")
-            append("$I2    listOf<Any?>(\n")
+            append("$I2    ${cls.name}(\n")
             cells.forEach { append("$I2        $it,\n") }
             append("$I2    )\n")
             append("$I2}\n")
         }
-        val chain = Chain("tables.getValue(${kotlinString(tableName)})", mutableListOf(segment))
+        val chain = Chain("tables.getValue(${kotlinString(tableName)})", cls, mutableListOf(segment))
         // A table scanned twice becomes one shared `val` instead of two copies.
         if (scanCounts.getOrDefault(tableName, 0) > 1) {
             val name = materialize(chain, tableName.lowercase())
-            scanVars[tableName] = name
-            return Chain(name)
+            val cached = Chain(name, cls)
+            scanVars[tableName] = cached
+            return Chain(name, cls)
         }
         return chain
     }
 
-    private fun filterSegment(rel: Filter): String {
+    private fun filterSegment(rel: Filter, cls: RowClass): String {
         val cond = rex.expand(rel.condition)
-        val (locals, ctx) = lambdaPrelude(listOf(cond), rel.input.rowType.fieldNames, indent = "$I2    ")
+        val ctx = RexContext(bindings("row", cls))
+        val (locals, localCtx) = sharedLocals(listOf(cond), ctx, indent = "$I2    ")
+        if (locals.isEmpty()) {
+            val oneLine = "$I2.filter { row -> ${rex.condition(cond, ctx.copy(indent = "$I2    "))} }\n"
+            if (oneLine.length <= 110 && '\n' !in oneLine.dropLast(1)) return oneLine
+        }
         return buildString {
             append("$I2.filter { row ->\n")
             locals.forEach { append("$it\n") }
-            append("$I2    ${rex.condition(cond, ctx)}\n")
+            append("$I2    ${rex.condition(cond, localCtx)}\n")
             append("$I2}\n")
         }
     }
 
-    private fun projectSegment(rel: Project): String {
-        val exprs = rel.projects.map { rex.expand(it) }
-        val outputFields = rel.rowType.fieldNames
-        val (locals, ctx) = lambdaPrelude(exprs, rel.input.rowType.fieldNames, outputFields, indent = "$I2    ")
+    private fun projectSegment(
+        projects: List<RexNode>,
+        rowType: RelDataType,
+        inputCls: RowClass,
+    ): Pair<String, RowClass> {
+        val exprs = projects.map { rex.expand(it) }
+        val outCls = rowClassOf(rowType, "Row")
 
-        val cellCtx = ctx.copy(indent = "$I2        ")
-        val cells = exprs.map { rex.expr(it, cellCtx) }
+        val param = if (exprs.any { rex.inputRefs(it).isNotEmpty() }) "row" else "_"
+        val ctx = RexContext(bindings("row", inputCls))
+        val (locals, localCtx) = sharedLocals(exprs, ctx, outCls.props, indent = "$I2    ")
+
+        val cellCtx = localCtx.copy(indent = "$I2        ")
+        val args = exprs.mapIndexed { i, e -> "${outCls.props[i]} = ${rex.expr(e, cellCtx)}" }
+
+        if (locals.isEmpty()) {
+            val oneLine = "$I2.map { $param -> ${outCls.name}(${args.joinToString(", ")}) }\n"
+            if (oneLine.length <= 110 && '\n' !in oneLine.dropLast(1)) return oneLine to outCls
+        }
         return buildString {
-            append("$I2.map { row ->\n")
+            append("$I2.map { $param ->\n")
             locals.forEach { append("$it\n") }
-            append("$I2    listOf<Any?>(\n")
-            cells.forEachIndexed { i, cell ->
-                val alias = outputFields[i]
-                val comment =
-                    if (!alias.startsWith("EXPR$") && !alias.startsWith("\$f") && !cell.contains('\n') &&
-                        !cell.equals(alias, ignoreCase = true)
-                    ) " // $alias" else ""
-                append("$I2        $cell,$comment\n")
-            }
+            append("$I2    ${outCls.name}(\n")
+            args.forEach { append("$I2        $it,\n") }
             append("$I2    )\n")
             append("$I2}\n")
-        }
+        } to outCls
     }
 
     private fun join(rel: Join): Chain {
-        val left = materialize(visit(rel.left), nameFor(rel.left))
-        val right = materialize(visit(rel.right), nameFor(rel.right))
-        val joinType = when (rel.joinType) {
-            JoinRelType.INNER -> "INNER"
-            JoinRelType.LEFT -> "LEFT"
-            JoinRelType.RIGHT -> "RIGHT"
-            JoinRelType.FULL -> "FULL"
-            JoinRelType.SEMI -> "SEMI"
-            JoinRelType.ANTI -> "ANTI"
+        val leftChain = visit(rel.left)
+        val leftCls = leftChain.rowClass
+        val left = materialize(leftChain, nameFor(rel.left))
+        val rightChain = visit(rel.right)
+        val rightCls = rightChain.rowClass
+        val right = materialize(rightChain, nameFor(rel.right))
+
+        val leftArity = leftCls.props.size
+        val cond = rex.expand(rel.condition)
+        val condBindings = buildMap {
+            for (i in rex.inputRefs(cond)) {
+                if (i < leftArity) put(i, "l.${leftCls.props[i]}") else put(i, "r.${rightCls.props[i - leftArity]}")
+            }
+        }
+        val condText = rex.condition(cond, RexContext(condBindings, indent = "$I1    "))
+
+        // SEMI/ANTI keep the left row type; no combiner needed.
+        if (rel.joinType == JoinRelType.SEMI || rel.joinType == JoinRelType.ANTI) {
+            val fn = if (rel.joinType == JoinRelType.SEMI) "semiJoin" else "antiJoin"
+            return Chain("$fn($left, $right) { l, r -> $condText }", leftCls)
+        }
+
+        val fn = when (rel.joinType) {
+            JoinRelType.INNER -> "innerJoin"
+            JoinRelType.LEFT -> "leftJoin"
+            JoinRelType.RIGHT -> "rightJoin"
+            JoinRelType.FULL -> "fullJoin"
             else -> throw UnsupportedOperationException("Unsupported join type: ${rel.joinType}")
         }
-        // The condition sees left fields followed by right fields; uniquify names.
-        val taken = mutableSetOf<String>()
-        val condFields = (rel.left.rowType.fieldNames + rel.right.rowType.fieldNames)
-        val leftArity = rel.left.rowType.fieldCount
-        val rightArity = rel.right.rowType.fieldCount
+        val lAcc = if (rel.joinType == JoinRelType.RIGHT || rel.joinType == JoinRelType.FULL) "l?" else "l"
+        val rAcc = if (rel.joinType == JoinRelType.LEFT || rel.joinType == JoinRelType.FULL) "r?" else "r"
 
-        val cond = rex.expand(rel.condition)
-        val bindings = mutableMapOf<Int, String>()
-        val locals = mutableListOf<String>()
-        for (i in rex.inputRefs(cond).sorted()) {
-            val name = localName(condFields.getOrElse(i) { "col$i" }, taken)
-            bindings[i] = name
-            locals += "${I1}    val $name = row[$i]"
+        val cls = rowClassOf(rel.rowType, "JoinedRow")
+        val args = cls.props.indices.map { i ->
+            if (i < leftArity) "$lAcc.${leftCls.props[i]}" else "$rAcc.${rightCls.props[i - leftArity]}"
         }
-        val ctx = RexContext(bindings, indent = "$I1    ")
 
-        val name = freshName("joined")
-        out.append("${I1}val $name = joinRows($left, $right, leftArity = $leftArity, rightArity = $rightArity, JoinType.$joinType) { row ->\n")
-        locals.forEach { out.append("$it\n") }
-        out.append("$I1    ${rex.condition(cond, ctx)}\n")
+        val name = freshVar("joined")
+        out.append("${I1}val $name = $fn($left, $right, on = { l, r -> $condText }) { l, r ->\n")
+        val oneLine = "$I1    ${cls.name}(${args.joinToString(", ")})\n"
+        if (oneLine.length <= 110) {
+            out.append(oneLine)
+        } else {
+            out.append("$I1    ${cls.name}(\n")
+            args.forEach { out.append("$I1        $it,\n") }
+            out.append("$I1    )\n")
+        }
         out.append("$I1}\n")
-        return Chain(name)
+        return Chain(name, cls)
     }
 
     private fun aggregate(rel: Aggregate): Chain {
         require(rel.groupSets.size == 1) { "GROUPING SETS / ROLLUP / CUBE are not supported" }
-        val inputFields = rel.input.rowType.fieldNames
         val keys = rel.groupSet.asList()
 
         // Global aggregate: exactly one output row, even for empty input.
         if (keys.isEmpty()) {
-            val input = materialize(visit(rel.input), nameFor(rel.input))
-            val name = freshName("aggregated")
-            out.append("${I1}val $name = listOf(\n")
-            out.append("$I1    listOf<Any?>(\n")
-            rel.aggCallList.forEach { call ->
-                out.append("$I1        ${aggExpr(call, input, inputFields)},${aggComment(call, inputFields)}\n")
+            val inputChain = visit(rel.input)
+            val inCls = inputChain.rowClass
+            val input = materialize(inputChain, nameFor(rel.input))
+            val cls = rowClassOf(rel.rowType, "GroupedRow")
+            val args = rel.aggCallList.mapIndexed { i, call ->
+                "${cls.props[i]} = ${aggExpr(call, input, inCls)}"
             }
-            out.append("$I1    ),\n")
-            out.append("$I1)\n")
-            return Chain(name)
+            val name = freshVar("aggregated")
+            val oneLine = "${I1}val $name = listOf(${cls.name}(${args.joinToString(", ")}))\n"
+            if (oneLine.length <= 110) {
+                out.append(oneLine)
+            } else {
+                out.append("${I1}val $name = listOf(\n")
+                out.append("$I1    ${cls.name}(\n")
+                args.forEach { out.append("$I1        $it,\n") }
+                out.append("$I1    ),\n")
+                out.append("$I1)\n")
+            }
+            return Chain(name, cls)
         }
 
         val chain = visit(rel.input)
+        val inCls = chain.rowClass
+        val outCls = rowClassOf(rel.rowType, "GroupedRow")
 
         // SELECT DISTINCT: group keys only, no aggregate calls.
         if (rel.aggCallList.isEmpty()) {
-            val keyCells = keys.joinToString(", ") { "row[$it]" }
-            chain.segments += "$I2.map { row -> listOf<Any?>($keyCells) } // ${keyComment(keys, inputFields)}\n"
+            val args = keys.mapIndexed { j, k -> "${outCls.props[j]} = row.${inCls.props[k]}" }
+            chain.segments += "$I2.map { row -> ${outCls.name}(${args.joinToString(", ")}) }\n"
             chain.segments += "$I2.distinct()\n"
+            chain.rowClass = outCls
             return chain
         }
 
-        val keyCells = keys.joinToString(", ") { "row[$it]" }
-        chain.segments += "$I2.groupBy { row -> listOf($keyCells) } // GROUP BY ${keyComment(keys, inputFields)}\n"
-        chain.segments += buildString {
-            append("$I2.map { (key, group) ->\n")
-            append("$I2    key + listOf<Any?>(\n")
-            rel.aggCallList.forEach { call ->
-                append("$I2        ${aggExpr(call, "group", inputFields)},${aggComment(call, inputFields)}\n")
-            }
+        val keyRefs: List<String>
+        val mapParams: String
+        if (keys.size == 1) {
+            chain.segments += "$I2.groupBy { row -> row.${inCls.props[keys[0]]} }\n"
+            val keyParam = outCls.props[0].let { if (it == "group") "${it}Key" else it }
+            keyRefs = listOf(keyParam)
+            mapParams = "($keyParam, group)"
+        } else {
+            val keyCls = rowClassOf(
+                keys.map { inCls.props[it].uppercase() },
+                keys.map { inCls.types[it] },
+                "GroupKey",
+            )
+            val keyArgs = keys.joinToString(", ") { "row.${inCls.props[it]}" }
+            chain.segments += "$I2.groupBy { row -> ${keyCls.name}($keyArgs) }\n"
+            keyRefs = keyCls.props.map { "key.$it" }
+            mapParams = "(key, group)"
+        }
+
+        val args = outCls.props.mapIndexed { i, p ->
+            if (i < keys.size) "$p = ${keyRefs[i]}"
+            else "$p = ${aggExpr(rel.aggCallList[i - keys.size], "group", inCls)}"
+        }
+        val oneLine = "$I2.map { $mapParams -> ${outCls.name}(${args.joinToString(", ")}) }\n"
+        chain.segments += if (oneLine.length <= 110) oneLine else buildString {
+            append("$I2.map { $mapParams ->\n")
+            append("$I2    ${outCls.name}(\n")
+            args.forEach { append("$I2        $it,\n") }
             append("$I2    )\n")
             append("$I2}\n")
         }
+        chain.rowClass = outCls
         return chain
     }
 
-    private fun keyComment(keys: List<Int>, fields: List<String>): String =
-        keys.joinToString(", ") { fields.getOrElse(it) { "col$it" } }
-
-    private fun aggComment(call: AggregateCall, fields: List<String>): String {
-        val args = call.argList.joinToString(", ") { fields.getOrElse(it) { "col$it" } }
-        val distinct = if (call.isDistinct) "DISTINCT " else ""
-        return " // ${call.aggregation.name}($distinct${args.ifEmpty { "*" }})"
-    }
-
-    private fun aggExpr(call: AggregateCall, groupVar: String, fields: List<String>): String {
+    private fun aggExpr(call: AggregateCall, groupVar: String, inCls: RowClass): String {
         require(!call.hasFilter()) { "FILTER clause on aggregates is not supported" }
         val args = call.argList
-        var values = if (args.isEmpty()) "" else "$groupVar.map { it[${args.single()}] }"
+        var values = if (args.isEmpty()) "" else "$groupVar.map { it.${inCls.props[args.single()]} }"
         if (call.isDistinct && args.isNotEmpty()) values += ".distinct()"
 
         val expr = when (call.aggregation.kind) {
@@ -307,33 +392,32 @@ class RelToKotlin(private val rex: RexToKotlin) {
             else -> throw UnsupportedOperationException("Unsupported aggregate function: ${call.aggregation.name}")
         }
 
-        // COUNT is already Long; AVG is already Double. SUM computes in
-        // Long/Double and narrows to the SQL-derived type.
+        // COUNT is already Long, AVG already Double; SUM computes in Long/Double
+        // and narrows to the SQL-derived type. MIN/MAX/SINGLE_VALUE are generic.
         return when (call.aggregation.kind) {
-            SqlKind.COUNT -> expr
+            SqlKind.SUM, SqlKind.SUM0 -> narrowAgg(call.type, expr)
             SqlKind.AVG -> when (call.type.sqlTypeName) {
                 SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE -> expr
-                else -> narrowTo(call.type.sqlTypeName, expr)
+                else -> narrowAgg(call.type, expr)
             }
-            SqlKind.SUM, SqlKind.SUM0 -> narrowTo(call.type.sqlTypeName, expr)
             else -> expr
         }
     }
 
-    private fun narrowTo(type: SqlTypeName, expr: String): String = when (type) {
+    private fun narrowAgg(type: RelDataType, expr: String): String = when (type.sqlTypeName) {
         SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER -> "asInt($expr)"
         SqlTypeName.BIGINT -> "asLong($expr)"
-        SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE, SqlTypeName.DECIMAL -> "asDouble($expr)"
+        SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE -> "asDouble($expr)"
+        SqlTypeName.DECIMAL -> if (type.scale > 0) "asDouble($expr)" else "asLong($expr)"
         else -> expr
     }
 
-    private fun sortSegments(rel: Sort): List<String> {
+    private fun sortSegments(rel: Sort, cls: RowClass): List<String> {
         val segments = mutableListOf<String>()
-        val fields = rel.input.rowType.fieldNames
 
         val collations = rel.collation.fieldCollations
         if (collations.isNotEmpty()) {
-            val keys = collations.map { fc ->
+            val comparators = collations.mapIndexed { i, fc ->
                 val asc = !fc.direction.isDescending
                 val nullsFirst = when (fc.nullDirection) {
                     RelFieldCollation.NullDirection.FIRST -> true
@@ -341,19 +425,17 @@ class RelToKotlin(private val rex: RexToKotlin) {
                     // Calcite's default: nulls sort as the largest value.
                     else -> fc.direction.isDescending
                 }
-                "SortKey(${fc.fieldIndex}, asc = $asc, nullsFirst = $nullsFirst)"
+                val fn = if (i == 0) "orderBy<${cls.name}>" else ".thenOrderBy"
+                "$fn({ it.${cls.props[fc.fieldIndex]} }, asc = $asc, nullsFirst = $nullsFirst)"
             }
-            val comment = collations.joinToString(", ") { fc ->
-                fields.getOrElse(fc.fieldIndex) { "col${fc.fieldIndex}" } +
-                    if (fc.direction.isDescending) " DESC" else ""
-            }
-            segments += if (keys.size == 1) {
-                "$I2.sortedWith(rowComparator(listOf(${keys.single()}))) // ORDER BY $comment\n"
+            segments += if (comparators.size == 1) {
+                "$I2.sortedWith(${comparators.single()})\n"
             } else {
                 buildString {
-                    append("$I2.sortedWith(rowComparator(listOf( // ORDER BY $comment\n")
-                    keys.forEach { append("$I2    $it,\n") }
-                    append("$I2)))\n")
+                    append("$I2.sortedWith(\n")
+                    append("$I2    ${comparators.first()}\n")
+                    comparators.drop(1).forEach { append("$I2        $it\n") }
+                    append("$I2)\n")
                 }
             }
         }
@@ -366,16 +448,34 @@ class RelToKotlin(private val rex: RexToKotlin) {
     }
 
     private fun values(rel: Values): Chain {
+        val cls = rowClassOf(rel.rowType, "ValuesRow")
+        if (rel.tuples.isEmpty()) return Chain("emptyList<${cls.name}>()", cls)
         val ctx = RexContext()
         val rows = rel.tuples.map { tuple ->
-            "listOf<Any?>(${tuple.joinToString(", ") { rex.expr(rex.expand(it), ctx) }})"
+            "${cls.name}(${tuple.joinToString(", ") { rex.expr(rex.expand(it), ctx) }})"
         }
-        return Chain("listOf(${rows.joinToString(", ")})")
+        return Chain("listOf(${rows.joinToString(", ")})", cls)
     }
 
     private fun union(rel: Union): Chain {
-        val inputs = rel.inputs.map { materialize(visit(it), nameFor(it)) }
-        val chain = Chain("(${inputs.joinToString(" + ")})")
+        val parts = mutableListOf<String>()
+        var target: RowClass? = null
+        for (input in rel.inputs) {
+            val chain = visit(input)
+            val cls = chain.rowClass
+            val v = materialize(chain, nameFor(input))
+            if (target == null) {
+                target = cls
+                parts += v
+            } else if (cls === target) {
+                parts += v
+            } else {
+                // Same shape, different class: re-wrap positionally.
+                val t = target
+                parts += "$v.map { ${t.name}(${cls.props.joinToString(", ") { "it.$it" }}) }"
+            }
+        }
+        val chain = Chain("(${parts.joinToString(" + ")})", target!!)
         if (!rel.all) chain.segments += "$I2.distinct()\n"
         return chain
     }
@@ -393,11 +493,11 @@ class RelToKotlin(private val rex: RexToKotlin) {
         else -> "rel"
     }
 
-    /** Final segment: positional rows -> named maps. */
-    private fun mapToRowsSegment(fieldNames: List<String>): String {
-        val pairs = fieldNames.mapIndexed { i, f -> "${kotlinString(f)} to row[$i]" }
+    /** Final segment: typed rows -> named maps (the function's public contract). */
+    private fun finalMapSegment(fieldNames: List<String>, cls: RowClass): String {
+        val pairs = fieldNames.mapIndexed { i, f -> "${kotlinString(f)} to row.${cls.props[i]}" }
         val oneLine = "$I2.map { row -> mapOf(${pairs.joinToString(", ")}) }\n"
-        if (oneLine.length <= 100) return oneLine
+        if (oneLine.length <= 110) return oneLine
         return buildString {
             append("$I2.map { row ->\n")
             append("$I2    mapOf(\n")
