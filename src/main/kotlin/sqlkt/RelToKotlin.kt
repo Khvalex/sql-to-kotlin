@@ -162,9 +162,13 @@ class RelToKotlin(private val rex: RexToKotlin) {
         is TableScan -> tableScan(rel)
         is Filter -> visit(rel.input).also { it.segments += filterSegment(rel, it.rowClass) }
         is Project -> visit(rel.input).also {
-            val (segment, outCls) = projectSegment(rel.projects, rel.rowType, it.rowClass)
-            it.segments += segment
-            it.rowClass = outCls
+            // Identity projections (same fields, same order) emit nothing;
+            // output aliases still surface via the final field names.
+            if (!org.apache.calcite.rex.RexUtil.isIdentity(rel.projects, rel.input.rowType)) {
+                val (segment, outCls) = projectSegment(rel.projects, rel.rowType, it.rowClass)
+                it.segments += segment
+                it.rowClass = outCls
+            }
         }
         is Join -> join(rel)
         is Aggregate -> aggregate(rel)
@@ -303,6 +307,24 @@ class RelToKotlin(private val rex: RexToKotlin) {
         return Chain(name, cls)
     }
 
+    /**
+     * Output field names for an aggregate: Calcite's internal EXPR$N / $fN
+     * names are replaced with names derived from the call (`avgAmount`).
+     */
+    private fun aggOutputFields(rel: Aggregate, inCls: RowClass): List<String> {
+        val keys = rel.groupSet.asList()
+        return rel.rowType.fieldNames.mapIndexed { i, raw ->
+            if (i < keys.size || !(raw.startsWith("EXPR$") || raw.startsWith("\$f"))) return@mapIndexed raw
+            val call = rel.aggCallList[i - keys.size]
+            val fn = call.aggregation.name.lowercase()
+            val arg = call.argList.singleOrNull()?.let { inCls.props[it] }
+            if (arg == null) fn else fn + arg.replaceFirstChar { it.uppercase() }
+        }
+    }
+
+    private fun aggregateRowClass(rel: Aggregate, inCls: RowClass): RowClass =
+        rowClassOf(aggOutputFields(rel, inCls), rel.rowType.fieldList.map { kotlinType(it.type) }, "GroupedRow")
+
     private fun aggregate(rel: Aggregate): Chain {
         require(rel.groupSets.size == 1) { "GROUPING SETS / ROLLUP / CUBE are not supported" }
         val keys = rel.groupSet.asList()
@@ -312,7 +334,7 @@ class RelToKotlin(private val rex: RexToKotlin) {
             val inputChain = visit(rel.input)
             val inCls = inputChain.rowClass
             val input = materialize(inputChain, nameFor(rel.input))
-            val cls = rowClassOf(rel.rowType, "GroupedRow")
+            val cls = aggregateRowClass(rel, inCls)
             val args = rel.aggCallList.mapIndexed { i, call ->
                 "${cls.props[i]} = ${aggExpr(call, input, inCls)}"
             }
@@ -332,7 +354,7 @@ class RelToKotlin(private val rex: RexToKotlin) {
 
         val chain = visit(rel.input)
         val inCls = chain.rowClass
-        val outCls = rowClassOf(rel.rowType, "GroupedRow")
+        val outCls = aggregateRowClass(rel, inCls)
 
         // SELECT DISTINCT: group keys only, no aggregate calls.
         if (rel.aggCallList.isEmpty()) {

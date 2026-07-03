@@ -128,10 +128,23 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
         }
     }
 
-    /** Kotlin `Boolean` (non-null) expression, for filter/join conditions and `when` branches. */
+    /**
+     * Kotlin `Boolean` (non-null) expression, for filter/join conditions and
+     * `when` branches. In this context only TRUE passes, which lets AND/OR/NOT
+     * decompose into `&&` / `||` / `== false` without losing SQL 3-valued
+     * semantics: `truth(and3(a, b)) == truth(a) && truth(b)`.
+     */
     fun condition(node: RexNode, ctx: RexContext): String {
-        val e = expr(node, ctx)
-        return if (node.toString() !in ctx.shared && isNonNullBoolean(node)) stripOuterParens(e) else "truth($e)"
+        if (node.toString() in ctx.shared) return "truth(${expr(node, ctx)})"
+        return when (node.kind) {
+            SqlKind.AND -> (node as RexCall).operands.joinToString(" && ") { condition(it, ctx) }
+            SqlKind.OR -> "(" + (node as RexCall).operands.joinToString(" || ") { condition(it, ctx) } + ")"
+            SqlKind.NOT -> "${expr((node as RexCall).operands[0], ctx)} == false"
+            else -> {
+                val e = expr(node, ctx)
+                if (isNonNullBoolean(node)) stripOuterParens(e) else "truth($e)"
+            }
+        }
     }
 
     /** `(salary != null)` -> `salary != null` when the parens wrap the whole expression. */
@@ -226,18 +239,18 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             // dtPlus/dtMinus are Any?-typed, so cast back to the derived type.
             SqlKind.PLUS ->
                 if (isDatetime(call.type.sqlTypeName)) "(${helper("dtPlus")} as ${kotlinType(call.type)})"
-                else narrow(call, helper("numAdd"))
+                else arith(call, "add", "numAdd", ctx)
             SqlKind.MINUS -> when {
                 isDatetime(call.type.sqlTypeName) -> "(${helper("dtMinus")} as ${kotlinType(call.type)})"
                 // `datetime - datetime` (MINUS_DATE operator, kind MINUS) yields an interval.
                 call.type.sqlTypeName in SqlTypeName.YEAR_INTERVAL_TYPES -> "dtDiffMonths(${arg(0)}, ${arg(1)})"
                 call.type.sqlTypeName in SqlTypeName.DAY_INTERVAL_TYPES -> "dtDiffDuration(${arg(0)}, ${arg(1)})"
-                else -> narrow(call, helper("numSub"))
+                else -> arith(call, "sub", "numSub", ctx)
             }
-            SqlKind.TIMES -> narrow(call, helper("numMul"))
-            SqlKind.DIVIDE -> narrow(call, helper("numDiv"))
-            SqlKind.MOD -> narrow(call, helper("numMod"))
-            SqlKind.MINUS_PREFIX -> narrow(call, "numNeg(${arg(0)})")
+            SqlKind.TIMES -> arith(call, "mul", "numMul", ctx)
+            SqlKind.DIVIDE -> arith(call, "div", "numDiv", ctx)
+            SqlKind.MOD -> arith(call, "mod", "numMod", ctx)
+            SqlKind.MINUS_PREFIX -> arith(call, "neg", "numNeg", ctx)
             SqlKind.PLUS_PREFIX -> arg(0)
 
             SqlKind.EXTRACT -> {
@@ -346,6 +359,35 @@ class RexToKotlin(private val rexBuilder: RexBuilder) {
             SqlTypeName.TIMESTAMP -> "asTimestamp($value)"
             else -> throw UnsupportedOperationException("Unsupported CAST target type: $target")
         }
+    }
+
+    /**
+     * Numeric family of a type, matching [kotlinType]: 'D' -> Double?,
+     * 'I' -> Int?, 'L' -> Long?, null -> not numeric.
+     */
+    private fun numericFamily(type: org.apache.calcite.rel.type.RelDataType): Char? =
+        when (type.sqlTypeName) {
+            SqlTypeName.TINYINT, SqlTypeName.SMALLINT, SqlTypeName.INTEGER -> 'I'
+            SqlTypeName.BIGINT -> 'L'
+            SqlTypeName.FLOAT, SqlTypeName.REAL, SqlTypeName.DOUBLE -> 'D'
+            SqlTypeName.DECIMAL -> if (type.scale > 0) 'D' else 'L'
+            else -> null
+        }
+
+    /**
+     * Arithmetic. When the result and every operand share one numeric family,
+     * a typed helper is emitted (`subD(a, b)`) — every expression of that
+     * family already translates to the matching Kotlin type, so no narrowing
+     * wrapper is needed. Mixed-type operands fall back to the generic
+     * Number-based helper plus a narrowing cast.
+     */
+    private fun arith(call: RexCall, typedName: String, genericName: String, ctx: RexContext): String {
+        val family = numericFamily(call.type)
+        val args = call.operands.joinToString(", ") { expr(it, ctx) }
+        if (family != null && call.operands.all { numericFamily(it.type) == family }) {
+            return "$typedName$family($args)"
+        }
+        return narrow(call, "$genericName($args)")
     }
 
     /**

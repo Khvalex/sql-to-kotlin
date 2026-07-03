@@ -6,7 +6,7 @@
 `RelNode`-дерева → кодогенератор → самодостаточный `.kt`-файл с функцией
 
 ```kotlin
-fun query(tables: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>>
+fun query(tables: Map<String, List<Map<String, Any?>>>, params: List<Any?> = emptyList()): List<Map<String, Any?>>
 ```
 
 `tables` — имя таблицы (UPPER CASE) → строки; строка — имя колонки → значение.
@@ -15,8 +15,9 @@ fun query(tables: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>>
 ## Пример
 
 ```
-gradle run                                    # демо-запрос
-gradle run --args="SELECT name FROM emp WHERE salary > 900"
+./gradlew run                                    # демо-запрос
+./gradlew run --args="SELECT name FROM emp WHERE salary > 900"
+./gradlew run --args=@query.sql                  # SQL из файла
 ```
 
 Вход:
@@ -66,7 +67,7 @@ private data class GroupedRow(
     val avgSal: Double?,
 )
 
-fun query(tables: Map<String, List<Map<String, Any?>>>): List<Map<String, Any?>> {
+fun query(tables: Map<String, List<Map<String, Any?>>>, params: List<Any?> = emptyList()): List<Map<String, Any?>> {
     val emp = tables.getValue("EMP")
         .map { r ->
             EmpRow(
@@ -156,7 +157,9 @@ equality, многотабличные), `CASE WHEN`, `IN`-списки, `BETWEE
 даты/время: литералы `DATE`/`TIME`/`TIMESTAMP`, сравнения и сортировка,
 `datetime ± INTERVAL`, разность дат (`(d1 - d2) DAY`), `EXTRACT`
 (`YEAR`/`QUARTER`/`MONTH`/`DAY`/`DOW`/`DOY`/`WEEK`/`HOUR`/`MINUTE`/`SECOND`),
-`CAST` строк в даты, `CURRENT_DATE`/`CURRENT_TIMESTAMP`.
+`CAST` строк в даты, `CURRENT_DATE`/`CURRENT_TIMESTAMP`,
+JDBC-плейсхолдеры `?` (значения передаются вторым аргументом `params`,
+типы выводит валидатор из контекста).
 
 Не поддержано: оконные функции, `WITH RECURSIVE`, `GROUPING SETS`/`ROLLUP`/
 `CUBE`, DDL, диалектные расширения, таймзоны (`TIMESTAMP WITH TIME ZONE`).
@@ -164,7 +167,7 @@ equality, многотабличные), `CASE WHEN`, `IN`-списки, `BETWEE
 ## Тесты
 
 ```
-gradle test
+./gradlew test
 ```
 
 Каждый тест — конкретный SQL-запрос: конвертер генерирует `.kt`, тест компилирует

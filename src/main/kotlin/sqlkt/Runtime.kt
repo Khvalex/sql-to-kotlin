@@ -80,6 +80,30 @@ private fun numBin(a: Any?, b: Any?, longOp: (Long, Long) -> Long, doubleOp: (Do
     }
 }
 
+// Typed null-propagating arithmetic, used when SQL derives one numeric family
+// for the whole expression (the common case).
+private fun addI(a: Int?, b: Int?): Int? = if (a == null || b == null) null else a + b
+private fun subI(a: Int?, b: Int?): Int? = if (a == null || b == null) null else a - b
+private fun mulI(a: Int?, b: Int?): Int? = if (a == null || b == null) null else a * b
+private fun divI(a: Int?, b: Int?): Int? = if (a == null || b == null) null else a / b
+private fun modI(a: Int?, b: Int?): Int? = if (a == null || b == null) null else a % b
+private fun negI(a: Int?): Int? = if (a == null) null else -a
+
+private fun addL(a: Long?, b: Long?): Long? = if (a == null || b == null) null else a + b
+private fun subL(a: Long?, b: Long?): Long? = if (a == null || b == null) null else a - b
+private fun mulL(a: Long?, b: Long?): Long? = if (a == null || b == null) null else a * b
+private fun divL(a: Long?, b: Long?): Long? = if (a == null || b == null) null else a / b
+private fun modL(a: Long?, b: Long?): Long? = if (a == null || b == null) null else a % b
+private fun negL(a: Long?): Long? = if (a == null) null else -a
+
+private fun addD(a: Double?, b: Double?): Double? = if (a == null || b == null) null else a + b
+private fun subD(a: Double?, b: Double?): Double? = if (a == null || b == null) null else a - b
+private fun mulD(a: Double?, b: Double?): Double? = if (a == null || b == null) null else a * b
+private fun divD(a: Double?, b: Double?): Double? = if (a == null || b == null) null else a / b
+private fun modD(a: Double?, b: Double?): Double? = if (a == null || b == null) null else a % b
+private fun negD(a: Double?): Double? = if (a == null) null else -a
+
+// Generic fallbacks for mixed-type operands (e.g. DOUBLE * INTEGER).
 private fun numAdd(a: Any?, b: Any?): Number? = numBin(a, b, { x, y -> x + y }, { x, y -> x + y })
 private fun numSub(a: Any?, b: Any?): Number? = numBin(a, b, { x, y -> x - y }, { x, y -> x - y })
 private fun numMul(a: Any?, b: Any?): Number? = numBin(a, b, { x, y -> x * y }, { x, y -> x * y })
