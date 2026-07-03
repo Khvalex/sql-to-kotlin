@@ -6,9 +6,10 @@ import java.io.File
 import kotlin.test.assertEquals
 
 /**
- * End-to-end demo on a user-defined schema: two joins + correlated scalar
- * sub-query (per-product average) + ORDER BY/LIMIT. Also dumps the generated
- * source to build/demo/ for inspection.
+ * Showcase: two real-world queries on a user-defined schema, with the exact
+ * generated Kotlin embedded below each test. The tests still compile and run
+ * the generated code against sample data, so the embedded listings are backed
+ * by a green build; fresh copies are also written to build/demo/ on each run.
  */
 class CustomSchemaDemoTest {
 
@@ -64,6 +65,44 @@ class CustomSchemaDemoTest {
         ),
     )
 
+    /**
+     * JDBC-style placeholders: values arrive through the params argument,
+     * their Kotlin types are inferred by the validator from context.
+     *
+     * SQL:
+     * ```
+     * SELECT id, city, price, area FROM items
+     * WHERE area > ? AND city = ? ORDER BY price LIMIT 100
+     * ```
+     *
+     * Generated (plus the runtime prelude in the same file):
+     * ```
+     * private data class ItemsRow(
+     *     val id: Int?,
+     *     val city: String?,
+     *     val price: Double?,
+     *     val area: Double?,
+     * )
+     *
+     * fun query(tables: Map<String, List<Map<String, Any?>>>, params: List<Any?> = emptyList()): List<Map<String, Any?>> {
+     *     return tables.getValue("ITEMS")
+     *         .map { r ->
+     *             ItemsRow(
+     *                 r["ID"] as Int?,
+     *                 r["CITY"] as String?,
+     *                 r["PRICE"] as Double?,
+     *                 r["AREA"] as Double?,
+     *             )
+     *         }
+     *         .filter { row ->
+     *             truth(gt(row.area, (params[0] as Double?))) && truth(eq(row.city, (params[1] as String?)))
+     *         }
+     *         .sortedWith(orderBy<ItemsRow>({ it.price }, asc = true, nullsFirst = false))
+     *         .take(100)
+     *         .map { row -> mapOf("ID" to row.id, "CITY" to row.city, "PRICE" to row.price, "AREA" to row.area) }
+     * }
+     * ```
+     */
     @Test
     fun `parameterized items query with jdbc placeholders`() {
         val itemsSchema = SqlSchema(
@@ -105,6 +144,157 @@ class CustomSchemaDemoTest {
         )
     }
 
+    /**
+     * Correlated scalar sub-query: Calcite decorrelates the per-product AVG
+     * into a standalone aggregation (val grouped) joined back on productid
+     * with the amount > avgAmount predicate.
+     *
+     * SQL (LIMIT is a literal — the converter bakes it in at generation time):
+     * ```
+     * SELECT a.id, a.amount, c.region, p.category
+     * FROM applications a
+     * JOIN clients c ON a.clientId = c.id
+     * JOIN products p ON a.productId = p.id
+     * WHERE c.segment = 'affluent'
+     *   AND a.amount > (SELECT AVG(a2.amount) FROM applications a2 WHERE a2.productId = a.productId)
+     * ORDER BY a.amount DESC
+     * LIMIT 10
+     * ```
+     *
+     * Generated (plus the runtime prelude in the same file):
+     * ```
+     * private data class ApplicationsRow(
+     *     val id: Int?,
+     *     val clientid: Int?,
+     *     val productid: Int?,
+     *     val amount: Double?,
+     * )
+     *
+     * private data class ClientsRow(
+     *     val id: Int?,
+     *     val region: String?,
+     *     val segment: String?,
+     * )
+     *
+     * private data class JoinedRow(
+     *     val id: Int?,
+     *     val clientid: Int?,
+     *     val productid: Int?,
+     *     val amount: Double?,
+     *     val id2: Int?,
+     *     val region: String?,
+     *     val segment: String?,
+     * )
+     *
+     * private data class ProductsRow(
+     *     val id: Int?,
+     *     val category: String?,
+     * )
+     *
+     * private data class JoinedRow2(
+     *     val id: Int?,
+     *     val clientid: Int?,
+     *     val productid: Int?,
+     *     val amount: Double?,
+     *     val id2: Int?,
+     *     val region: String?,
+     *     val segment: String?,
+     *     val id3: Int?,
+     *     val category: String?,
+     * )
+     *
+     * private data class Row(
+     *     val productid: Int?,
+     *     val amount: Double?,
+     * )
+     *
+     * private data class GroupedRow(
+     *     val productid: Int?,
+     *     val avgAmount: Double?,
+     * )
+     *
+     * private data class JoinedRow3(
+     *     val id: Int?,
+     *     val clientid: Int?,
+     *     val productid: Int?,
+     *     val amount: Double?,
+     *     val id2: Int?,
+     *     val region: String?,
+     *     val segment: String?,
+     *     val id3: Int?,
+     *     val category: String?,
+     *     val productid2: Int?,
+     *     val avgAmount: Double?,
+     * )
+     *
+     * private data class Row2(
+     *     val id: Int?,
+     *     val amount: Double?,
+     *     val region: String?,
+     *     val category: String?,
+     * )
+     *
+     * fun query(tables: Map<String, List<Map<String, Any?>>>, params: List<Any?> = emptyList()): List<Map<String, Any?>> {
+     *     val applications = tables.getValue("APPLICATIONS")
+     *         .map { r ->
+     *             ApplicationsRow(
+     *                 r["ID"] as Int?,
+     *                 r["CLIENTID"] as Int?,
+     *                 r["PRODUCTID"] as Int?,
+     *                 r["AMOUNT"] as Double?,
+     *             )
+     *         }
+     *     val filtered = tables.getValue("CLIENTS")
+     *         .map { r -> ClientsRow(r["ID"] as Int?, r["REGION"] as String?, r["SEGMENT"] as String?) }
+     *         .filter { row -> truth(eq(row.segment, "affluent")) }
+     *     val joined = innerJoin(applications, filtered, on = { l, r -> truth(eq(l.clientid, r.id)) }) { l, r ->
+     *         JoinedRow(l.id, l.clientid, l.productid, l.amount, r.id, r.region, r.segment)
+     *     }
+     *     val products = tables.getValue("PRODUCTS")
+     *         .map { r -> ProductsRow(r["ID"] as Int?, r["CATEGORY"] as String?) }
+     *     val joined2 = innerJoin(joined, products, on = { l, r -> truth(eq(l.productid, r.id)) }) { l, r ->
+     *         JoinedRow2(l.id, l.clientid, l.productid, l.amount, l.id2, l.region, l.segment, r.id, r.category)
+     *     }
+     *     val grouped = applications
+     *         .filter { row -> row.productid != null }
+     *         .map { row -> Row(productid = row.productid, amount = row.amount) }
+     *         .groupBy { row -> row.productid }
+     *         .map { (productid, group) ->
+     *             GroupedRow(
+     *                 productid = productid,
+     *                 avgAmount = aggAvg(group.map { it.amount }),
+     *             )
+     *         }
+     *     val joined3 = innerJoin(joined2, grouped, on = { l, r -> truth(eq(l.productid, r.productid)) && truth(gt(l.amount, r.avgAmount)) }) { l, r ->
+     *         JoinedRow3(
+     *             l.id,
+     *             l.clientid,
+     *             l.productid,
+     *             l.amount,
+     *             l.id2,
+     *             l.region,
+     *             l.segment,
+     *             l.id3,
+     *             l.category,
+     *             r.productid,
+     *             r.avgAmount,
+     *         )
+     *     }
+     *     return joined3
+     *         .map { row -> Row2(id = row.id, amount = row.amount, region = row.region, category = row.category) }
+     *         .sortedWith(orderBy<Row2>({ it.amount }, asc = false, nullsFirst = true))
+     *         .take(10)
+     *         .map { row ->
+     *             mapOf(
+     *                 "ID" to row.id,
+     *                 "AMOUNT" to row.amount,
+     *                 "REGION" to row.region,
+     *                 "CATEGORY" to row.category,
+     *             )
+     *         }
+     * }
+     * ```
+     */
     @Test
     fun `applications above per-product average for affluent clients`() {
         val sql = """

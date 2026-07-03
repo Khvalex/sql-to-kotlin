@@ -288,7 +288,10 @@ class RelToKotlin(private val rex: RexToKotlin) {
         val lAcc = if (rel.joinType == JoinRelType.RIGHT || rel.joinType == JoinRelType.FULL) "l?" else "l"
         val rAcc = if (rel.joinType == JoinRelType.LEFT || rel.joinType == JoinRelType.FULL) "r?" else "r"
 
-        val cls = rowClassOf(rel.rowType, "JoinedRow")
+        // Inherit the (possibly synthesized) property names of both sides
+        // instead of Calcite's uniquified raw names, so e.g. an aggregate's
+        // avgAmount keeps its name through the join.
+        val cls = rowClassOf(leftCls.props + rightCls.props, leftCls.types + rightCls.types, "JoinedRow")
         val args = cls.props.indices.map { i ->
             if (i < leftArity) "$lAcc.${leftCls.props[i]}" else "$rAcc.${rightCls.props[i - leftArity]}"
         }
